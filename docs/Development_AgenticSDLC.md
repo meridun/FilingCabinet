@@ -8,11 +8,11 @@ This is the *why* behind the prompts. Read it once; the prompts are self-contain
 > `sdlc/`, `test/`, `.github/agents/sdlc-worker.agent.md`, `docs/Development_AgenticSDLC.md`, and
 > `docs/Development_Sdlc*.md`, then bump this pin. Local adaptations to preserve: doc pointers
 > renamed to this repo's `docs/Development_*` / `.github/` paths; `PROD_BRANCH=main` in
-> `sdlc/bindings/gh-issue/sdlc.mjs` and the profile; the `proj-doc-tiers` skill name in
+> `sdlc/bindings/gh-issue/sdlc.mjs` and the profile; the `fc-doc-tiers` skill name in
 > `sdlc/lanes/ship.md`; the `verifier` / `security-executor` stances inlined in
 > `sdlc/lanes/verify.md` / `audit.md` (declared in `sdlc/PROFILE.md` § Known deviations); the
 > `ado-feature` / `ado-pbi` bindings and their profile examples **declined** (no Azure DevOps
-> downstream yet — revisit when one appears); CI in `.github/workflows/ci.yml` targets `dev`/`main`.
+> downstream yet — revisit when one appears); CI in `.github/workflows/ci.yml` targets `dev`/`master`.
 
 ## The idea
 

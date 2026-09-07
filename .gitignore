@@ -1,4 +1,48 @@
+# --- Node / template tooling ---
 node_modules/
 graphify-out/
 .sdlc-cache/
 *.log
+
+# --- FilingCabinet: NO USER DOCUMENTS IN THIS REPO ---
+# Framework + documentation only. The index database, the document root, the inbox,
+# snapshots, plans, and any exports live OUTSIDE the repo. These patterns are a hard
+# backstop so a scan can never be committed by accident; `npm run check:docs` enforces
+# the same rule in CI against tracked files.
+data/
+inbox/
+documents/
+snapshots/
+exports/
+plans/
+config.toml
+
+# SQLite database + WAL sidecars (any name, anywhere)
+*.db
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
+
+# Scanned-document formats (backstop against dropping a scan in the tree)
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.heic
+*.webp
+*.bmp
+*.gif
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Allow-list: framework files that happen to match a pattern above
+!docs/**/*.png

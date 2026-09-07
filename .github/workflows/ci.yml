@@ -3,19 +3,28 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [dev, main]
+    branches: [dev, master]
 
 jobs:
-  checks:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e . pytest
+      - run: pytest
+
+  meta:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # Zero-dependency repo: no install step. Tests cover sdlc/bindings/gh-issue/sdlc.mjs and
-      # sdlc/tools/check-lint-baseline.mjs (pure helpers; the ratchet's full-tree run is an
-      # adopter-side CI step — see docs/Development_SdlcAdoption.md § 5) plus the meta-drift guard.
       - run: npm run sync:claude-config:check
       - run: npm run check:meta-drift
+      # Framework-only repo: fail before a user document or database lands in it.
+      - run: npm run check:docs
       - run: npm test
