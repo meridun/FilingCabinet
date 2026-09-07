@@ -63,6 +63,10 @@ auto-merged), and `dupe_label` (the labelled sample). The perceptual-hash stack 
 `dedup` extra: without it `dupes report` still reports the exact tier and says
 `phash_available: false`.
 
+On a large corpus the near/subset passes stop at a candidate-pair budget and report
+`truncated: true` in `--json` — a truncated run is a partial scan of tiers 2-3, not a clean bill
+of health; re-run or narrow the corpus if that matters for a given pass.
+
 ## 5. OCR (phase 4)
 
 A ladder, configured in `[ocr].ladder`, walked per page until confidence clears
