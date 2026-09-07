@@ -23,6 +23,7 @@ report zero, the summary says phash_available false, and the exit code stays 0.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,6 +79,17 @@ class Match:
     document_b: int
     score: float
     detail: str
+
+
+@dataclass
+class ScanStats:
+    """Out-parameter for a pairwise pass: did it stop at its candidate budget?
+
+    Reported rather than estimated - a pass sets this only when it actually left
+    candidates unexamined.
+    """
+
+    truncated: bool = False
 
 
 def _now() -> str:
@@ -155,11 +167,17 @@ def ensure_page_hashes(
     """
     if not phash_available():
         return 0, 0
-    root = Path(root)
+    root = Path(root).resolve()
     documents = 0
     pages = 0
     for row in pending_hash_documents(conn, limit=limit):
         path = root / row["rel_path"]
+        try:
+            # Same guard as ingest.run_ingest: a rel_path was inside the root at scan
+            # time, but a symlink planted since must never make us render outside it.
+            path.resolve().relative_to(root)
+        except (OSError, ValueError):
+            continue
         try:
             hashes = page_phashes(path)
         except Exception:
@@ -243,14 +261,44 @@ def match_pages(pages_a: list[str], pages_b: list[str], *, max_distance: int) ->
     return total / len(pages_a)
 
 
-def pair_budget_exceeded(conn: sqlite3.Connection, *, max_pairs: int = MAX_PAIRS) -> bool:
-    """True when the hashed corpus has more candidate pairs than a pass will examine."""
-    count = len(_page_hashes_by_document(conn))
-    return count * (count - 1) // 2 > max_pairs
+def _pairs_within(
+    doc_ids: Iterable[int], pages: dict[int, list[str]], *, equal_length: bool
+) -> Iterator[tuple[int, int]]:
+    """Yield the candidate pairs among `doc_ids`, bucketed by page count.
+
+    Bucketing first means every pair yielded is one a tier could match, so a caller
+    that stops at its budget does work proportional to what it consumed - never to
+    the corpus squared.
+    """
+    buckets: dict[int, list[int]] = {}
+    for doc_id in doc_ids:
+        count = len(pages[doc_id])
+        if count:
+            buckets.setdefault(count, []).append(doc_id)
+    counts = sorted(buckets)
+    for bucket in buckets.values():
+        bucket.sort()
+    if equal_length:
+        for count in counts:
+            bucket = buckets[count]
+            for index, first in enumerate(bucket):
+                for second in bucket[index + 1:]:
+                    yield first, second
+        return
+    for index, smaller in enumerate(counts):
+        for larger in counts[index + 1:]:
+            for first in buckets[smaller]:
+                for second in buckets[larger]:
+                    yield first, second
 
 
-def _candidate_pairs(pages: dict[int, list[str]], *, equal_length: bool) -> list[tuple[int, int]]:
-    """Ordered (a, b) candidates, bucketed by page count.
+def _candidate_pairs(
+    pages: dict[int, list[str]], *, equal_length: bool
+) -> Iterator[tuple[int, int]]:
+    """Lazily yield (a, b) candidates, bucketed by page count.
+
+    A generator by contract: the cross product is never materialized, so a caller that
+    stops at its pair budget holds bounded memory on a corpus of any size.
 
     `equal_length` selects the near tier's equal-page-count buckets; otherwise the subset
     tier's strictly-smaller-into-larger pairs. Documents sharing an exact page hash are
@@ -261,44 +309,36 @@ def _candidate_pairs(pages: dict[int, list[str]], *, equal_length: bool) -> list
         for phash in hashes:
             by_hash.setdefault(phash, set()).add(doc_id)
 
-    def keep(a: int, b: int) -> bool:
-        if equal_length:
-            return a < b and len(pages[a]) == len(pages[b])
-        return 0 < len(pages[a]) < len(pages[b])
-
+    # Only pairs already emitted are remembered, so `seen` stays bounded by what the
+    # caller consumed.
     seen: set[tuple[int, int]] = set()
-    prefiltered: list[tuple[int, int]] = []
     for doc_ids in by_hash.values():
         if len(doc_ids) < 2:
             continue
-        ordered = sorted(doc_ids)
-        for i, first in enumerate(ordered):
-            for second in ordered[i + 1:]:
-                for pair in ((first, second), (second, first)):
-                    if pair not in seen and keep(*pair):
-                        seen.add(pair)
-                        prefiltered.append(pair)
-
-    rest: list[tuple[int, int]] = []
-    ordered_docs = sorted(pages)
-    for i, first in enumerate(ordered_docs):
-        for second in ordered_docs[i + 1:]:
-            for pair in ((first, second), (second, first)):
-                if pair not in seen and keep(*pair):
-                    seen.add(pair)
-                    rest.append(pair)
-    return prefiltered + rest
+        for pair in _pairs_within(doc_ids, pages, equal_length=equal_length):
+            if pair not in seen:
+                seen.add(pair)
+                yield pair
+    for pair in _pairs_within(pages, pages, equal_length=equal_length):
+        if pair not in seen:  # the prefiltered pass already yielded it
+            yield pair
 
 
 def near_duplicates(
-    conn: sqlite3.Connection, *, max_distance: int, max_pairs: int = MAX_PAIRS
+    conn: sqlite3.Connection,
+    *,
+    max_distance: int,
+    max_pairs: int = MAX_PAIRS,
+    stats: ScanStats | None = None,
 ) -> list[Match]:
     """Equal-page-count documents whose pages all pair within `max_distance`."""
     pages = _page_hashes_by_document(conn)
     shas = _sha256_by_document(conn)
     matches: list[Match] = []
     for examined, pair in enumerate(_candidate_pairs(pages, equal_length=True)):
-        if examined >= max_pairs:
+        if examined >= max_pairs:  # candidates left unexamined: say so, never hang
+            if stats is not None:
+                stats.truncated = True
             break
         a, b = pair
         # Defensive: distinct document rows cannot share a sha256 (UNIQUE), so this only
@@ -321,13 +361,19 @@ def near_duplicates(
 
 
 def subset_matches(
-    conn: sqlite3.Connection, *, max_distance: int, max_pairs: int = MAX_PAIRS
+    conn: sqlite3.Connection,
+    *,
+    max_distance: int,
+    max_pairs: int = MAX_PAIRS,
+    stats: ScanStats | None = None,
 ) -> list[Match]:
     """Documents whose every page appears in a strictly longer document (A inside B)."""
     pages = _page_hashes_by_document(conn)
     matches: list[Match] = []
     for examined, pair in enumerate(_candidate_pairs(pages, equal_length=False)):
-        if examined >= max_pairs:
+        if examined >= max_pairs:  # candidates left unexamined: say so, never hang
+            if stats is not None:
+                stats.truncated = True
             break
         a, b = pair
         if match_pages(pages[a], pages[b], max_distance=max_distance) is None:
@@ -361,22 +407,22 @@ def queue_review(conn: sqlite3.Connection, matches, *, now: str) -> int:
     with conn:
         for match in matches:
             document_a, document_b = _normalized(match)
-            row = conn.execute(
-                "SELECT review_id FROM dupe_review "
-                "WHERE kind = ? AND document_a = ? AND document_b = ?",
-                (match.kind, document_a, document_b),
-            ).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO dupe_review (kind, document_a, document_b, score, detail, "
-                    "status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-                    (match.kind, document_a, document_b, match.score, match.detail, now),
-                )
+            # Insert-or-nothing first: a concurrent `dupes report` losing the race gets a
+            # no-op, not an IntegrityError. Never a SELECT-then-INSERT - that read would
+            # land outside the write transaction.
+            cursor = conn.execute(
+                "INSERT INTO dupe_review (kind, document_a, document_b, score, detail, "
+                "status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?) "
+                "ON CONFLICT(kind, document_a, document_b) DO NOTHING",
+                (match.kind, document_a, document_b, match.score, match.detail, now),
+            )
+            if cursor.rowcount:
                 inserted += 1
             else:  # status and resolved_at belong to the human, never overwritten here
                 conn.execute(
-                    "UPDATE dupe_review SET score = ?, detail = ? WHERE review_id = ?",
-                    (match.score, match.detail, row["review_id"]),
+                    "UPDATE dupe_review SET score = ?, detail = ? "
+                    "WHERE kind = ? AND document_a = ? AND document_b = ?",
+                    (match.score, match.detail, match.kind, document_a, document_b),
                 )
     return inserted
 
@@ -476,9 +522,10 @@ def run_report(
     hashed_documents, hashed_pages = ensure_page_hashes(conn, root, now=stamp)
     errors = max(pending_before - hashed_documents, 0)
 
+    stats = ScanStats()
     exact = exact_duplicates(conn)
-    near = near_duplicates(conn, max_distance=max_distance) if available else []
-    subset = subset_matches(conn, max_distance=max_distance) if available else []
+    near = near_duplicates(conn, max_distance=max_distance, stats=stats) if available else []
+    subset = subset_matches(conn, max_distance=max_distance, stats=stats) if available else []
     queued = queue_review(conn, [*near, *subset], now=stamp)
 
     return DupeSummary(
@@ -490,6 +537,6 @@ def run_report(
         hashed_documents=hashed_documents,
         hashed_pages=hashed_pages,
         phash_available=available,
-        truncated=pair_budget_exceeded(conn) if available else False,
+        truncated=stats.truncated,
         errors=errors,
     )

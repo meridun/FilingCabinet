@@ -150,7 +150,12 @@ def _resolve_max_distance(args: argparse.Namespace) -> int:
     configured = load_config(args.config).get("dedup", {}).get("phash_max_distance")
     if configured is None:
         return dedup_mod.DEFAULT_PHASH_MAX_DISTANCE
-    return int(configured)
+    try:  # a bad config value is a CLI error, not a traceback
+        return int(configured)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"error: [dedup].phash_max_distance must be an integer, got {configured!r}"
+        ) from None
 
 
 def cmd_dupes_report(args: argparse.Namespace) -> int:

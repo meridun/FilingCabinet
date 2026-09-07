@@ -1,4 +1,7 @@
+import itertools
 import os
+import tracemalloc
+from collections.abc import Iterator
 
 import pytest
 
@@ -141,6 +144,55 @@ def test_near_duplicates_ignores_unequal_page_counts(conn):
     assert dedup.near_duplicates(conn, max_distance=2) == []
 
 
+def test_candidate_pairs_emits_shared_hash_candidates_first():
+    pages = {1: [_hash(1)], 2: [_hash(9)], 3: [_hash(1)]}
+    pairs = list(dedup._candidate_pairs(pages, equal_length=True))
+    assert pairs[0] == (1, 3)  # the pair sharing an exact page hash leads
+    assert sorted(pairs) == [(1, 2), (1, 3), (2, 3)]
+
+
+def test_candidate_pairs_never_materializes_the_cross_product():
+    """A caller that stops at its budget must not pay for the whole corpus squared."""
+    pages = {doc_id: [_hash(doc_id)] for doc_id in range(4000)}  # ~8M pairs if listed
+    pairs = dedup._candidate_pairs(pages, equal_length=True)
+    assert isinstance(pairs, Iterator)  # lazy by contract, never a list
+    tracemalloc.start()
+    try:
+        taken = list(itertools.islice(pairs, 100))
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(set(taken)) == 100
+    assert peak < 5_000_000  # materializing 8M pairs cost ~1 GB
+
+
+def test_near_duplicates_stops_at_the_pair_budget_and_says_so(conn):
+    for index in range(4):  # 6 candidate pairs, all matching
+        _doc_with_pages(conn, f"sha-{index}", [_hash(1)])
+    stats = dedup.ScanStats()
+    matches = dedup.near_duplicates(conn, max_distance=0, max_pairs=2, stats=stats)
+    assert len(matches) == 2
+    assert stats.truncated is True
+
+
+def test_near_duplicates_within_the_budget_is_not_truncated(conn):
+    _doc_with_pages(conn, "sha-a", [_hash(1)])
+    _doc_with_pages(conn, "sha-b", [_hash(1)])
+    stats = dedup.ScanStats()
+    assert len(dedup.near_duplicates(conn, max_distance=0, max_pairs=10, stats=stats)) == 1
+    assert stats.truncated is False
+
+
+def test_subset_matches_stops_at_the_pair_budget_and_says_so(conn):
+    _doc_with_pages(conn, "sha-a", [_hash(1)])
+    _doc_with_pages(conn, "sha-b", [_hash(1)])
+    _doc_with_pages(conn, "sha-c", [_hash(1), _hash(1)])
+    stats = dedup.ScanStats()
+    matches = dedup.subset_matches(conn, max_distance=0, max_pairs=1, stats=stats)
+    assert len(matches) == 1
+    assert stats.truncated is True
+
+
 # --- tier 3: subset -----------------------------------------------------------------
 
 
@@ -177,6 +229,16 @@ def test_queue_review_is_idempotent(conn):
     assert dedup.queue_review(conn, [_match("near", a, b)], now=NOW) == 1
     assert dedup.queue_review(conn, [_match("near", a, b)], now=NOW) == 0
     assert conn.execute("SELECT COUNT(*) AS n FROM dupe_review").fetchone()["n"] == 1
+
+
+def test_queue_review_refreshes_score_and_detail(conn):
+    a = _doc_with_pages(conn, "sha-a", [_hash(1)])
+    b = _doc_with_pages(conn, "sha-b", [_hash(1)])
+    dedup.queue_review(conn, [_match("near", a, b)], now=NOW)
+    refreshed = dedup.Match(kind="near", document_a=a, document_b=b, score=0.5, detail="fresh")
+    assert dedup.queue_review(conn, [refreshed], now=NOW) == 0
+    row = conn.execute("SELECT score, detail FROM dupe_review").fetchone()
+    assert (row["score"], row["detail"]) == (0.5, "fresh")
 
 
 def test_queue_review_preserves_a_human_verdict(conn):
@@ -327,6 +389,19 @@ def test_ensure_page_hashes_skips_documents_it_cannot_read(conn, tmp_path, avail
     assert dedup.ensure_page_hashes(conn, tmp_path, now=NOW) == (0, 0)
     summary = dedup.run_report(conn, tmp_path, max_distance=6, now=NOW)
     assert summary.errors == 1 and summary.hashed_documents == 0
+
+
+def test_ensure_page_hashes_refuses_a_path_outside_the_root(conn, tmp_path, available,
+                                                            monkeypatch):
+    root = tmp_path / "docs"
+    root.mkdir()
+    (tmp_path / "outside.pdf").write_bytes(b"%PDF-1.4\n")
+    document_id = _add_document(conn, "sha-a", page_count=1)
+    _add_occurrence(conn, document_id, os.path.join("..", "outside.pdf"))
+    monkeypatch.setattr(
+        dedup, "page_phashes", lambda *a, **k: pytest.fail("rendered a file outside the root")
+    )
+    assert dedup.ensure_page_hashes(conn, root, now=NOW) == (0, 0)
 
 
 # The real render path needs the optional `dedup` extra; it is skipped where it is absent

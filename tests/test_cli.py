@@ -150,6 +150,16 @@ def test_dupes_report_threshold_precedence(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["max_distance"] == 1
 
 
+def test_dupes_report_rejects_a_non_numeric_threshold(tmp_path, capsys):
+    dbp = _migrated_db(tmp_path, capsys)
+    root = _make_root(tmp_path)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[dedup]\nphash_max_distance = "six"\n')
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--db", dbp, "--config", str(cfg), "dupes", "report", "--root", str(root)])
+    assert "phash_max_distance" in str(excinfo.value)
+
+
 def _two_documents(dbp):
     conn = db.connect(dbp)
     try:
