@@ -1,4 +1,4 @@
-"""`filingcabinet` (alias `fc`) command-line entry point. Verbs: migrate, status, ingest.
+"""`filingcabinet` (alias `fc`) command-line entry point. Verbs: migrate, status, ingest, instance.
 
 DB path resolution: --db flag > FC_DB env var > config.toml [paths].data_dir + /filingcabinet.db.
 Config path resolution: --config flag > FC_CONFIG env var > ./config.toml.
@@ -14,7 +14,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-from . import __version__, db, ingest as ingest_mod
+from . import __version__, db, ingest as ingest_mod, instance as instance_mod
 
 DB_FILENAME = "filingcabinet.db"
 
@@ -134,6 +134,22 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_instance_init(args: argparse.Namespace) -> int:
+    try:
+        result = instance_mod.init_instance(Path(args.dir), force=args.force)
+    except NotADirectoryError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    except OSError as exc:
+        raise SystemExit(f"error: cannot scaffold instance at {args.dir}: {exc}") from exc
+    _emit(
+        args,
+        result,
+        f"initialized instance at {result['path']}: "
+        f"{len(result['created'])} created, {len(result['skipped'])} skipped",
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="filingcabinet", description=__doc__.splitlines()[0])
     parser.add_argument("--version", action="version", version=f"filingcabinet {__version__}")
@@ -152,6 +168,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ingest", help="scan the document root and index new or changed files")
     p.add_argument("--root", help="document root (overrides FC_ROOT and config)")
     p.set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser("instance", help="manage the private instance repo")
+    instance_sub = p.add_subparsers(dest="instance_command", required=True)
+    q = instance_sub.add_parser("init", help="scaffold a new instance directory")
+    q.add_argument("dir", help="target directory for the instance")
+    q.add_argument("--force", action="store_true", help="overwrite existing scaffold files")
+    q.set_defaults(func=cmd_instance_init)
     return parser
 
 

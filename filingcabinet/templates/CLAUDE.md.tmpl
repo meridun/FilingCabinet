@@ -1,0 +1,23 @@
+# {instance_name} — agent instructions
+
+This is a **private FilingCabinet instance**, not the framework. The engine and CLI live in the
+[FilingCabinet](https://github.com/meridun/FilingCabinet) repository, pinned at
+`{framework_version}`. Do not edit engine code from here; file an issue in the framework repo.
+
+## Invariants
+
+- **Tools never move or rename documents unasked** (framework `docs/Architecture.md` §6). Index
+  and propose; a human confirms; `apply` is explicit, logged in the move-log, and reversible.
+- **No document bytes and no credentials in this directory.** Documents stay in the Drive folder.
+  The `.gitignore` blocks document and database formats; never force-add past it.
+- **Never grant broad Drive or app access.** Scope credentials to the indexed document folder.
+- `[paths].data_dir` is local-only; `[paths].snapshot_dir` is the cloud-synced one.
+
+## Usage
+
+Run every verb against this instance's config:
+
+```
+filingcabinet --config {config_path} status
+filingcabinet --config {config_path} ingest
+```

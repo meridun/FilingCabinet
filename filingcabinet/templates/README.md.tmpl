@@ -1,0 +1,56 @@
+# {instance_name}
+
+Private FilingCabinet **instance**. This directory holds your configuration, taxonomy and rules,
+index snapshots, and the move-log export. It is not the framework — the code lives in the
+[FilingCabinet](https://github.com/meridun/FilingCabinet) repository, pinned here at
+`{framework_version}`.
+
+## Do not grant broad Drive or app access
+
+- Never grant an agent, script, or third-party app broad access to your Drive account or to this
+  directory's parent. Scope every credential to the single document folder FilingCabinet indexes.
+- Never commit Drive credentials, OAuth tokens, service-account keys, or any document bytes here.
+  The `.gitignore` in this directory is a backstop, not permission to try.
+- Documents stay in the Drive folder. This instance stores *metadata about* them, never copies.
+- Tools never move or rename documents unasked: `propose` is advisory, `apply` is explicit,
+  logged in the move-log, and reversible.
+
+## What lives here
+
+| Here (instance, private) | There (framework, public-capable) |
+|---|---|
+| `config.toml` — your machine's paths | engine + CLI code |
+| taxonomy and naming rules | migrations, tests |
+| index snapshots (`snapshot_dir` exports) | documentation |
+| the move-log export | no user data of any kind |
+
+The live index database is **not** here either: it lives at `[paths].data_dir`, which must be a
+local-only directory (never inside Drive/OneDrive/Dropbox — cloud sync corrupts SQLite WAL
+sidecars mid-write).
+
+## Setup
+
+1. Edit `config.toml` — at minimum `[paths] root`, `inbox`, `data_dir`, `snapshot_dir`.
+2. Create the index: `filingcabinet --config {config_path} migrate --create`
+3. First scan: `filingcabinet --config {config_path} ingest`
+
+## Scheduling the recurring ingest sweep
+
+The recurring sweep runs **from this instance**, not from the framework checkout. Point every
+scheduled invocation at this directory's `config.toml`; the framework checkout is neither the
+working directory nor a place user data may land.
+
+Windows Task Scheduler (primary host):
+
+```
+schtasks /Create /TN FilingCabinetIngest /SC HOURLY ^
+  /TR "python -m filingcabinet --config {config_path} ingest"
+```
+
+cron:
+
+```
+0 * * * * python -m filingcabinet --config {config_path} ingest
+```
+
+See `docs/Development_Instance.md` in the framework repo for the full walkthrough.
