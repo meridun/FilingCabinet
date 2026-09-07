@@ -272,3 +272,26 @@ def test_restore_twice_in_one_second_keeps_each_rescue_copy(tmp_path):
     assert rescue.read_bytes() == live_before, "restore overwrote the rescue copy it read from"
     assert second["row_counts"]["document"] == 2, "restoring the rescue copy did not undo"
     assert Path(second["rescue_copy"]) != rescue, "each restore must bank its own rescue copy"
+
+
+def test_restore_twice_same_second_banks_two_distinct_rescue_copies(tmp_path):
+    """Two ordinary restores in one second must not share a rescue filename either.
+
+    The aliasing case above is the loudest symptom; the general rule is that no restore
+    ever overwrites an earlier restore's bank.
+    """
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    older = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    _insert_document(dbp, "b" * 64)
+    newer = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW + timedelta(seconds=1))
+
+    first = snapshot.restore_snapshot(dbp, newer, now=NOW)
+    second = snapshot.restore_snapshot(dbp, older, now=NOW)
+
+    banks = sorted((dbp.parent / snapshot.RESCUE_DIRNAME).glob("*.db"))
+    assert len(banks) == 2, "the second restore overwrote the first restore's bank"
+    assert first["rescue_copy"] != second["rescue_copy"]
+    for bank in banks:  # each bank is a restorable index, not a truncated placeholder
+        assert snapshot.validate_snapshot(bank)["integrity"] == "ok"
+    assert second["row_counts"]["document"] == 1

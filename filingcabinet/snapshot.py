@@ -35,6 +35,8 @@ WEEKLY_RETENTION_WEEKS = 12
 SIDECAR_SUFFIXES = ("-wal", "-shm")
 
 RESCUE_DIRNAME = "rescue"
+# How many same-stamp rescue names to try before giving up (see _claim_rescue_path).
+RESCUE_COLLISION_LIMIT = 100
 
 
 class SnapshotError(RuntimeError):
@@ -190,6 +192,30 @@ def sidecar_paths(db_path: str | Path) -> list[Path]:
     return [Path(str(db_path) + suffix) for suffix in SIDECAR_SUFFIXES]
 
 
+def _claim_rescue_path(rescue_dir: Path, db_path: Path, stamp: str) -> Path:
+    """Create and return an unused ``<stem>-pre-restore-<stamp>[-N].db`` in ``rescue_dir``.
+
+    The rescue copy is the only undo ``restore`` offers, so it must never land on an
+    existing file: two restores in the same wall-clock second share a timestamp, and the
+    second would otherwise overwrite the first one's bank - including the case where that
+    bank *is* the snapshot being restored from. The file is created exclusively (not merely
+    checked for absence) so a concurrent restore cannot claim the same name.
+    """
+    base = f"{db_path.stem}-pre-restore-{stamp}"
+    for index in range(RESCUE_COLLISION_LIMIT):
+        suffix = "" if index == 0 else f"-{index + 1}"
+        candidate = rescue_dir / f"{base}{suffix}.db"
+        try:
+            candidate.touch(exist_ok=False)  # claim the name; copy2 fills it in
+        except FileExistsError:
+            continue
+        return candidate
+    raise SnapshotError(
+        f"could not bank a rescue copy in {rescue_dir}: "
+        f"{RESCUE_COLLISION_LIMIT} names already taken for {base}"
+    )
+
+
 def restore_snapshot(
     db_path: str | Path,
     source: str | Path,
@@ -211,7 +237,7 @@ def restore_snapshot(
         rescue_dir = db_path.parent / RESCUE_DIRNAME
         rescue_dir.mkdir(parents=True, exist_ok=True)
         stamp = _utcnow(now).strftime(SNAPSHOT_TS_FORMAT)
-        rescue_copy = rescue_dir / f"{db_path.stem}-pre-restore-{stamp}.db"
+        rescue_copy = _claim_rescue_path(rescue_dir, db_path, stamp)
         shutil.copy2(db_path, rescue_copy)
 
     cleared: list[str] = []
