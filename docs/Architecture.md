@@ -38,7 +38,10 @@ Incremental and resumable; safe to run on a schedule.
 Migration `002_ingest.sql` adds the two columns ingest needs: `occurrence.conflict_kind`
 (NULL = ordinary path, `drive_numbered` for `foo (1).pdf`, `drive_conflicted_copy` for a
 "conflicted copy" filename) and `occurrence.hashed_at` (when the current `document_id` binding
-was computed). Candidate extensions and exclude patterns default in `filingcabinet/ingest.py`
+was computed). Migration `003_scan.sql` adds the `scan` table (one AUTOINCREMENT row per
+ingest run) and `occurrence.last_scan_id`: the missing sweep orders by that monotonic token
+rather than by wall-clock time, which on a coarse system clock can tie between runs.
+Candidate extensions and exclude patterns default in `filingcabinet/ingest.py`
 and are overridable via `[ingest]` in `config.toml`. `ingest --json` reports scanned / new /
 changed / unchanged / missing / error counts.
 

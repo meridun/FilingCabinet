@@ -24,7 +24,8 @@ def root(tmp_path):
     return r
 
 
-def _rows(conn, table, skip=("seen_at",)):
+# seen_at and last_scan_id are per-run bookkeeping, not index state.
+def _rows(conn, table, skip=("seen_at", "last_scan_id")):
     rows = [dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
     return [{k: v for k, v in row.items() if k not in skip} for row in rows]
 
@@ -115,6 +116,31 @@ def test_missing_file_marked_not_deleted(conn, root):
     assert conn.execute("SELECT COUNT(*) n FROM occurrence").fetchone()["n"] == 3
     row = conn.execute("SELECT missing_since FROM occurrence WHERE rel_path='b.pdf'").fetchone()
     assert row["missing_since"] is not None
+
+
+def test_missing_sweep_survives_a_frozen_clock(conn, root, monkeypatch):
+    """The sweep must not depend on wall-clock resolution (issue #2 verify bounce).
+
+    The Windows system clock ticks every ~0.5-16 ms, so two ingest runs over a small
+    tree can share a timestamp. With the clock pinned - the worst case of that - a
+    deleted file must still be flagged.
+    """
+    monkeypatch.setattr(ingest, "_now", lambda: "2026-01-01T00:00:00.000000+00:00")
+    ingest.run_ingest(conn, root)
+    (root / "b.pdf").unlink()
+    summary = ingest.run_ingest(conn, root)
+    assert summary.missing == 1
+    row = conn.execute("SELECT missing_since FROM occurrence WHERE rel_path='b.pdf'").fetchone()
+    assert row["missing_since"] is not None
+
+
+def test_scan_ids_are_monotonic_and_stamped(conn, root):
+    ingest.run_ingest(conn, root)
+    ingest.run_ingest(conn, root)
+    ids = [r["scan_id"] for r in conn.execute("SELECT scan_id FROM scan ORDER BY scan_id")]
+    assert ids == sorted(set(ids)) and len(ids) == 2
+    stamped = {r["last_scan_id"] for r in conn.execute("SELECT last_scan_id FROM occurrence")}
+    assert stamped == {ids[-1]}
 
 
 def test_returned_file_clears_missing_since(conn, root):

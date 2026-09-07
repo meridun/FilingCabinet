@@ -59,11 +59,21 @@ class IngestSummary:
 def _now() -> str:
     """UTC ISO timestamp, microsecond precision.
 
-    Finer than ``db.py``'s second resolution on purpose: ``mark_missing`` sweeps by
-    comparing ``seen_at`` against this run's start, and two whole runs over a small tree
-    can fall inside one second.
+    Finer than ``db.py``'s second resolution, but never used for ordering: the host
+    clock ticks coarsely enough that two runs can share a timestamp, so the missing
+    sweep orders by :func:`start_scan`'s monotonic ``scan_id`` instead.
     """
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def start_scan(conn: sqlite3.Connection, *, now: str) -> int:
+    """Open a scan row and return its ``scan_id`` - this run's monotonic token.
+
+    AUTOINCREMENT guarantees a strictly greater id than every previous run's, which is
+    what makes the missing sweep independent of wall-clock resolution.
+    """
+    cursor = conn.execute("INSERT INTO scan (started_at) VALUES (?)", (now,))
+    return int(cursor.lastrowid)
 
 
 def _matches_any(name: str, patterns: tuple[str, ...]) -> bool:
@@ -150,7 +160,9 @@ def _upsert_document(
     ).fetchone()["document_id"]
 
 
-def upsert_file(conn: sqlite3.Connection, root: Path, path: Path, *, now: str) -> str:
+def upsert_file(
+    conn: sqlite3.Connection, root: Path, path: Path, *, now: str, scan_id: int
+) -> str:
     """Index one file. Returns ``"new" | "changed" | "unchanged"``.
 
     Skips hashing when the recorded (mtime, size) still match and the path is not marked
@@ -171,8 +183,9 @@ def upsert_file(conn: sqlite3.Connection, root: Path, path: Path, *, now: str) -
         and row["size_bytes"] == stat.st_size
     ):
         conn.execute(
-            "UPDATE occurrence SET seen_at = ?, conflict_kind = ? WHERE occurrence_id = ?",
-            (now, conflict, row["occurrence_id"]),
+            "UPDATE occurrence SET seen_at = ?, conflict_kind = ?, last_scan_id = ? "
+            "WHERE occurrence_id = ?",
+            (now, conflict, scan_id, row["occurrence_id"]),
         )
         return "unchanged"
 
@@ -182,8 +195,8 @@ def upsert_file(conn: sqlite3.Connection, root: Path, path: Path, *, now: str) -
     conn.execute(
         """
         INSERT INTO occurrence (document_id, rel_path, mtime, size_bytes, seen_at,
-                                missing_since, conflict_kind, hashed_at)
-        VALUES (:doc, :rel, :mtime, :size, :now, NULL, :conflict, :now)
+                                missing_since, conflict_kind, hashed_at, last_scan_id)
+        VALUES (:doc, :rel, :mtime, :size, :now, NULL, :conflict, :now, :scan_id)
         ON CONFLICT(rel_path) DO UPDATE SET
           document_id   = excluded.document_id,
           mtime         = excluded.mtime,
@@ -191,7 +204,8 @@ def upsert_file(conn: sqlite3.Connection, root: Path, path: Path, *, now: str) -
           seen_at       = excluded.seen_at,
           missing_since = NULL,
           conflict_kind = excluded.conflict_kind,
-          hashed_at     = excluded.hashed_at
+          hashed_at     = excluded.hashed_at,
+          last_scan_id  = excluded.last_scan_id
         """,
         {
             "doc": document_id,
@@ -200,17 +214,23 @@ def upsert_file(conn: sqlite3.Connection, root: Path, path: Path, *, now: str) -
             "size": stat.st_size,
             "now": now,
             "conflict": conflict,
+            "scan_id": scan_id,
         },
     )
     return "changed" if row is not None else "new"
 
 
-def mark_missing(conn: sqlite3.Connection, *, scan_started_at: str, now: str) -> int:
-    """Mark paths not seen by this scan as missing (never delete). Returns the count."""
+def mark_missing(conn: sqlite3.Connection, *, scan_id: int, now: str) -> int:
+    """Mark paths this scan did not see as missing (never delete). Returns the count.
+
+    Ordering is by ``last_scan_id``, not by timestamp: a row this run touched carries
+    exactly ``scan_id``, so anything else is unseen regardless of clock resolution.
+    Rows written before migration 003 have ``last_scan_id IS NULL`` and are swept too.
+    """
     cursor = conn.execute(
         "UPDATE occurrence SET missing_since = ? "
-        "WHERE missing_since IS NULL AND seen_at < ?",
-        (now, scan_started_at),
+        "WHERE missing_since IS NULL AND (last_scan_id IS NULL OR last_scan_id < ?)",
+        (now, scan_id),
     )
     return cursor.rowcount
 
@@ -225,7 +245,7 @@ def run_ingest(
     """Scan ``root``, index new/changed files, reconcile missing paths."""
     db.require_migrated(conn)
     root = Path(root).resolve()
-    scan_started_at = _now()
+    scan_id = start_scan(conn, now=_now())
     counts = {"new": 0, "changed": 0, "unchanged": 0}
     scanned = 0
     errors = 0
@@ -240,12 +260,12 @@ def run_ingest(
             continue
         try:
             with conn:  # commit per file: an interrupted run is resumable
-                counts[upsert_file(conn, root, path, now=_now())] += 1
+                counts[upsert_file(conn, root, path, now=_now(), scan_id=scan_id)] += 1
         except OSError:
             errors += 1  # locked mid-Drive-sync: count and carry on
 
     with conn:
-        missing = mark_missing(conn, scan_started_at=scan_started_at, now=_now())
+        missing = mark_missing(conn, scan_id=scan_id, now=_now())
 
     return IngestSummary(
         scanned=scanned,
