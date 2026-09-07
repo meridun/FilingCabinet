@@ -1,9 +1,9 @@
 ---
-name: proj-upstream-sync
+name: fc-upstream-sync
 description: Compare, port, and pin shared repo-config components between a project repo and the model-repo upstream hub (instructions, skills, agents, hooks, SDLC prompts, sync scripts). Use when asked to "sync with model-repo", "port this improvement upstream", "migrate the latest X from model-repo", or to audit a repo's shared config for drift against upstream.
 ---
 
-# proj-upstream-sync
+# fc-upstream-sync
 
 The compare/port procedure for shared repo configuration. `meridun/model-repo` is the **hub**:
 project repos port significant improvements **into** it (generalised), and other project repos
@@ -20,7 +20,7 @@ migrate components **out** of it. Both sides run this same skill, so the steps a
 
 - Editing a component for this repo only, with no intent to share — normal editing rules apply.
 - Syncing `.github/` → `.claude/` inside one repo — that is `npm run sync:claude-config`, covered
-  by [proj-agent-skill](../proj-agent-skill/SKILL.md).
+  by [fc-agent-skill](../fc-agent-skill/SKILL.md).
 - External upstreams (pilotfish, graphify, agentic-sdlc) — same pin format, but the re-sync
   instructions live in the component's own L3 doc; follow those.
 
@@ -34,7 +34,7 @@ migrate components **out** of it. Both sides run this same skill, so the steps a
   **Depends on** column — take the dependency too, or substitute and name it in the pin.
 - **Pin** — a `> **Upstream pin:**` blockquote near the top of the component's L3 doc recording
   what the component was last synced against. Components with no L3 doc pin in the inventory row.
-- **Generalised form** — what model-repo holds: `<PLACEHOLDERS>` for project specifics, `proj-`
+- **Generalised form** — what model-repo holds: `<PLACEHOLDERS>` for project specifics, `fc-`
   as the skill/agent prefix, no project names, paths, or commands.
 - **Local adaptation** — a deliberate project-side deviation, named in the project's pin so the
   next sync preserves it instead of flagging it.
@@ -73,7 +73,7 @@ migrate components **out** of it. Both sides run this same skill, so the steps a
 
 | Class | Example | Action |
 |---|---|---|
-| Fill-in | `<TEST_CMD>` → `npm test`; `proj-` → `acme-` | ignore |
+| Fill-in | `<TEST_CMD>` → `npm test`; `fc-` → `acme-` | ignore |
 | Local adaptation (named in pin) | `PROD_BRANCH=main`; CLI relocated to `scripts/` | preserve, ignore |
 | Improvement | new rule, new lane, clearer prompt, bug fix, new test | port |
 | Undocumented divergence | a rule dropped on one side with no rationale | ask; do not resolve silently |
@@ -84,7 +84,7 @@ migrate components **out** of it. Both sides run this same skill, so the steps a
 
 1. Branch from `dev` in model-repo (`feat/port-<component>-<project>`).
 2. Apply only **Improvement** rows. Generalise on the way: project specifics → `<PLACEHOLDERS>`
-   (add new ones to `sdlc/PROFILE.md` and `docs/Development_SdlcAdoption.md` if SDLC), prefix → `proj-`, drop project
+   (add new ones to `sdlc/PROFILE.md` and `docs/Development_SdlcAdoption.md` if SDLC), prefix → `fc-`, drop project
    names and paths.
 3. Update the component's L3 doc pin (`<source>` = the project repo, sha = its HEAD) and the
    inventory row if paths changed.
@@ -140,7 +140,7 @@ start the other as a separate change — never mix directions in one commit.
 
 ## Gotchas
 
-- **Prefix rename hides real diffs.** Normalise `proj-`/`<prefix>-` before diffing, or every
+- **Prefix rename hides real diffs.** Normalise `fc-`/`<prefix>-` before diffing, or every
   skill reference reads as changed.
 - **`.claude/` is generated.** Never diff or port `.claude/skills/` or `.claude/agents/`; diff the
   `.github/` sources and regenerate.
@@ -158,7 +158,7 @@ start the other as a separate change — never mix directions in one commit.
 ## References
 
 - model-repo `README.md` — role, sync workflow, component inventory
-- [proj-agent-skill](../proj-agent-skill/SKILL.md) — skill authoring, `sync:claude-config`,
+- [fc-agent-skill](../fc-agent-skill/SKILL.md) — skill authoring, `sync:claude-config`,
   meta-drift guard
-- [proj-doc-tiers](../proj-doc-tiers/SKILL.md) — where ported knowledge belongs (L1/L2/L3)
+- [fc-doc-tiers](../fc-doc-tiers/SKILL.md) — where ported knowledge belongs (L1/L2/L3)
 - `docs/Development_ModelRouting.md`, `docs/Development_AgenticSDLC.md` — existing pins to imitate

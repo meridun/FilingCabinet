@@ -74,7 +74,7 @@ import { fileURLToPath } from 'url';
 // `<WORKTREE_ROOT>/<issue#>` pattern your prompts use — the dispatcher's sweep
 // only touches worktrees matching it.
 export const DEFAULT_BRANCH = 'dev'; // adapt to your repo (e.g. 'main')
-export const PROD_BRANCH = 'main'; // adapt to your repo (e.g. 'release')
+export const PROD_BRANCH = 'master';
 /** Sibling-worktree name for an issue: <repoName>-wt-<issue#>. */
 export const worktreeName = (repoName, issue) => `${repoName}-wt-${issue}`;
 

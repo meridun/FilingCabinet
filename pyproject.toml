@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filingcabinet"
+version = "0.1.0"
+description = "Local-first engine for OCR, dedup, and organization of scanned documents - the SQLite index is truth for identity and metadata"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+# Phase 4 OCR ladder, rung 1 (local). PyMuPDF reads embedded text layers and rasterizes
+# pages that lack one; `tesseract` itself is a soft system dependency (docs/Development.md).
+ocr = ["PyMuPDF>=1.24"]
+# Phase 3 near-duplicate detection: perceptual page hashes.
+dedup = ["PyMuPDF>=1.24", "ImageHash>=4.3", "Pillow>=10"]
+# Phase 7 MCP wrapper. The engine and CLI need none of it.
+mcp = ["mcp>=1.0"]
+
+[project.scripts]
+filingcabinet = "filingcabinet.cli:main"
+fc = "filingcabinet.cli:main"
+
+[tool.setuptools]
+packages = ["filingcabinet"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

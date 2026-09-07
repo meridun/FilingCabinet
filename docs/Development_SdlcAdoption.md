@@ -30,8 +30,8 @@ Two Claude Code notes:
   dispatch machine, the per-lane tier table in `dispatch.md` is a no-op. Unset it for the
   dispatcher's environment.
 
-- *(optional)* `.github/skills/proj-doc-tiers/` → your harness's skill dir (Claude Code:
-  `.claude/skills/proj-doc-tiers/`). Copy it if the ship stage's docs fan-out should follow the
+- *(optional)* `.github/skills/fc-doc-tiers/` → your harness's skill dir (Claude Code:
+  `.claude/skills/fc-doc-tiers/`). Copy it if the ship stage's docs fan-out should follow the
   hub-and-spoke tier discipline; skip it if your docs are a flat README.
 
 ## 2. Pick the binding

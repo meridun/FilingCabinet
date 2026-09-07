@@ -8,19 +8,21 @@
   unrelated files even to "improve" them.
 - **Follow existing patterns** — consistency over novelty; find a similar implementation before
   inventing one.
-- **Test everything changed** — code edits need test updates; run targeted tests, full suite only
-  on request or pre-merge.
+- **Test everything changed** — code edits need test updates; run targeted tests (`pytest
+  tests/<file>`), full suite only on request or pre-merge.
+- **Tools never move or rename documents unasked.** Index and propose; a human confirms; `apply`
+  is explicit, logged in the move-log, and reversible. See `docs/Architecture.md`.
+- **No user documents in this repo.** Framework only. `.gitignore` blocks document formats and
+  databases; `npm run check:docs` fails CI if one slips through.
 - **No git operations** unless explicitly requested.
-- **Git flow** — `{feature} → dev → main`. All work happens on feature branches cut from `dev`
-  (the default/integration branch). `main`/`master` is prod: never branch from, checkout, or merge
-  to it unless explicitly requested. Adjust to your repo's actual branch model.
+- **Git flow** — `{feature} → dev → master`. All work happens on feature branches cut from `dev`
+  (the default/integration branch). `master` is prod: never branch from, checkout, or merge to it
+  unless explicitly requested.
 
 ## Memory vs Documentation
 
-- Claude Code: use its own `~/.claude` memory for fresh or uncertain lessons. Copilot: use
-  `/memories/` (workspace-local, not version-controlled).
-- Promote to L3 docs once verified, broadly applicable, and useful to humans — then shorten the
-  memory entry to a pointer.
+- Fresh or uncertain lessons go to memory (Claude Code: `~/.claude`; Copilot: `/memories/`).
+- Promote to L3 docs once verified and broadly useful; then shorten the memory entry to a pointer.
 
 ## Documentation Tiers
 
@@ -33,15 +35,13 @@ The skill list and agent list are auto-injected into every request — do not du
 Match task to skill description and load it before implementing.
 
 L3 entry points: [Overview.md](../docs/Overview.md), [Architecture.md](../docs/Architecture.md),
-[Documentation.md](../docs/Documentation.md).
+[Development.md](../docs/Development.md), [Documentation.md](../docs/Documentation.md).
 
 ## Compound Tasks (load skills sequentially, not all at once)
 
-Add rows here as your project grows multi-skill build sequences, e.g.:
-
 | Task | Skill sequence |
 |---|---|
-| Session-end knowledge harvest / doc-tier audit | `proj-doc-tiers` → `proj-agent-skill` |
+| Session-end knowledge harvest / doc-tier audit | `fc-doc-tiers` → `fc-agent-skill` |
 
 ## Orchestration (role delegation)
 
@@ -72,10 +72,6 @@ fan-out inherit the main-session model. Don't delegate single-file reads, decisi
 the user asked *you* to judge — delegation has overhead. If the harness can't spawn subagents
 (some Copilot surfaces), apply each role's checklist inline instead.
 
-## Tone
-
-Professional and concise.
-
 ## Caveman mode
 
 Terse by default. No preamble, no restated question, no recap or summary unless asked. No
@@ -91,18 +87,11 @@ checked); for Copilot, restate this section at the top of a session if it drifts
 
 ## graphify
 
-Once `graphify-out/graph.json` exists (see [graphify](https://github.com/anthropics)), it's your
-**first** action for any architecture / structure / "how do I…, where is…, what does…" question —
-before grep or raw reads. It returns a scoped subgraph, usually far smaller than raw output.
-
-- `graphify query "<question>"` — scoped subgraph for how/where/what; `graphify path "<A>" "<B>"`
-  for relationships; `graphify explain "<concept>"` for a focused concept.
-- Read source files only to modify/debug specific code, when the graph lacks detail, or when it's
-  stale.
+If `graphify-out/graph.json` exists, `graphify query` comes before grep or raw reads for any
+architecture / "where is, how does" question; verbs and rules in `docs/Development_TokenTools.md`.
 
 ## Token wrappers
 
-`vtk` (see `docs/Development_TokenTools.md`) is wired at the tool-call layer (`vtk hooks init`)
-and/or shell layer (`vtk install`): plain top-level `git`/`gh`/`npm`/`winget`/`choco`/`reg`
-(hook also `grep`/`ls`/`find`) are wrapped automatically. Never prefix `vtk` yourself — no
-double-wrapping. Pipes and chains run unwrapped by design; `vtk show <id>` recovers raw output.
+`vtk` (see `docs/Development_TokenTools.md`) is wired as shell wrappers: plain top-level
+`git`/`gh`/`npm` are routed through it inside Claude Code sessions. Never prefix `vtk` yourself.
+Pipes and chains run unwrapped by design; `vtk show <id>` recovers raw output.

@@ -1,0 +1,30 @@
+# FilingCabinet configuration - copy to config.toml (gitignored) and edit for your machine.
+#
+# Path policy (docs/Architecture.md):
+#   * root     is the Drive-synced document folder. Bytes live here; Google Drive replicates.
+#              FilingCabinet reads it and, only on an approved `apply`, renames/moves within it.
+#   * inbox    is a folder (usually under root) where the scanner/phone drops new files.
+#   * data_dir is LOCAL-ONLY - never inside Google Drive/OneDrive/Dropbox. The live index runs
+#              in WAL mode; cloud sync corrupts the -wal/-shm sidecars mid-write.
+#   * snapshot_dir IS cloud-synced - `VACUUM INTO` snapshots are single consistent files.
+
+[paths]
+root = 'C:\Users\you\My Drive\Documents'
+inbox = 'C:\Users\you\My Drive\Documents\_inbox'
+data_dir = 'C:\filingcabinet-data'
+snapshot_dir = 'C:\Users\you\My Drive\filingcabinet\snapshots'
+
+[naming]
+# Python format template over document fields. Missing fields drop with their separator.
+# Refine from real examples (phase 5).
+template = "{doc_date}_{party}_{doc_type}_{detail}"
+
+[ocr]
+# Ladder: local first, drive when the Drive API lands, vision (agent-driven) as last resort.
+ladder = ["local", "vision"]
+# Pages below this local-OCR mean confidence escalate to the next rung.
+min_confidence = 0.75
+
+[dedup]
+# Near-duplicate threshold on perceptual page-hash Hamming distance (lower = stricter).
+phash_max_distance = 6

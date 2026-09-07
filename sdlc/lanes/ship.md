@@ -37,8 +37,8 @@ Otherwise, in the issue's worktree (`<WORKTREE_ROOT>/<issue#>`) on build's branc
 
 - **Docs fan-out — by necessity, not ritual** (a sink fires only when the change earns it). Route to
   `<DOCS_SINKS>` — the project's documentation targets — using this discipline (when a sink is a
-  tiered reference tree and the `proj-doc-tiers` skill is installed, apply its
-  naming/sizing/placement rules inline — see `.github/skills/proj-doc-tiers/SKILL.md`):
+  tiered reference tree and the `fc-doc-tiers` skill is installed, apply its
+  naming/sizing/placement rules inline — see `.github/skills/fc-doc-tiers/SKILL.md`):
   - **User-facing docs** (guide / README) — whenever user-visible behavior changed (new command, flag,
     output, or UI). Written in user voice, **true to what actually shipped** — if docs and code diverge,
     the code wins.
