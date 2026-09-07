@@ -34,3 +34,10 @@ def test_require_migrated_raises():
     conn = db.connect(":memory:")
     with pytest.raises(db.NotMigratedError):
         db.require_migrated(conn)
+
+
+def test_002_adds_occurrence_columns():
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(occurrence)")}
+    assert {"conflict_kind", "hashed_at"} <= cols
