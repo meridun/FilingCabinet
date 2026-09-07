@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Zero-dependency repo: no install step. Tests cover sdlc/bindings/gh-issue/sdlc.mjs and
+      # sdlc/tools/check-lint-baseline.mjs (pure helpers; the ratchet's full-tree run is an
+      # adopter-side CI step — see docs/Development_SdlcAdoption.md § 5) plus the meta-drift guard.
+      - run: npm run sync:claude-config:check
+      - run: npm run check:meta-drift
+      - run: npm test
