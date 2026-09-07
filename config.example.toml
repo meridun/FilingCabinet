@@ -28,3 +28,10 @@ min_confidence = 0.75
 [dedup]
 # Near-duplicate threshold on perceptual page-hash Hamming distance (lower = stricter).
 phash_max_distance = 6
+
+[ingest]
+# Candidate document suffixes and exclude globs. Both default in filingcabinet/ingest.py;
+# uncomment to override. Excludes are matched case-insensitively against file and directory
+# names (sync-client scratch, Office lock files, partial downloads).
+# extensions = [".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".heic", ".webp"]
+# exclude = [".*", "~$*", "*.tmp", "*.crdownload", "*.driveupload", "*.tmp.drivedownload"]
