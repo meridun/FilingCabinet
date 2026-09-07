@@ -27,4 +27,5 @@ process.
   `Development_SdlcAdoption.md` (copy the tree, pick the binding, fill the profile), `Development_SdlcComposability.md`
   (9-stage canonical spine), `Development_SdlcProfileExample.md` (worked `gh-issue` profile);
   the label taxonomy lives in `sdlc/bindings/gh-issue/labels.md`
+- `Development_Instance.md` — the framework/instance split and `instance init`
 - `Development_TokenTools.md` — vtk/graphify setup notes, if adopted

@@ -24,6 +24,9 @@ fc = "filingcabinet.cli:main"
 [tool.setuptools]
 packages = ["filingcabinet"]
 
+[tool.setuptools.package-data]
+filingcabinet = ["templates/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

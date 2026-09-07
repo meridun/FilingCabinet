@@ -1,0 +1,38 @@
+# --- NO DOCUMENT BYTES, NO DATABASES, NO CREDENTIALS IN THIS INSTANCE ---
+# Metadata only. Documents stay in the Drive folder; the live index lives at
+# [paths].data_dir, which is local-only and outside this directory.
+# config.toml and snapshots/ are deliberately NOT ignored here - tracking them
+# is the point of an instance repo.
+
+data/
+inbox/
+documents/
+exports/
+plans/
+
+# Credentials and tokens (never commit)
+*.pem
+*.key
+credentials.json
+token.json
+client_secret*.json
+.env
+
+# SQLite database + WAL sidecars (any name, anywhere)
+*.db
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
+
+# Scanned-document formats
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.heic
+*.webp
+*.bmp
+*.gif

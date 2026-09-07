@@ -103,6 +103,8 @@ dependency; `pip install filingcabinet[mcp]` adds it.
 - **Instance repo (per user, private):** `config.toml`, taxonomy and rules, index snapshots,
   the move-log export. Documents stay in the Drive folder; Drive is their backup. This
   deliberately diverges from pemr-data, which commits a content-addressed copy of every scan.
+  Scaffold one with `filingcabinet instance init <dir>` - see
+  [Development_Instance.md](Development_Instance.md).
 - **pemr:** independent. Both projects use sha256 content IDs, so a later bridge (pemr
   referencing a FilingCabinet document) is a lookup, not a dependency. No shared code or DB.
 
