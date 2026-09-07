@@ -246,3 +246,29 @@ def test_snapshot_and_restore_touch_no_documents(tmp_path):
 
     assert list(root.iterdir()) == [doc]
     assert (doc.read_bytes(), doc.stat().st_mtime_ns) == stat_before
+
+
+def test_restore_twice_in_one_second_keeps_each_rescue_copy(tmp_path):
+    """The rescue copy is the only undo `restore` offers, so it must never be clobbered.
+
+    Two restores inside the same wall-clock second derive the same rescue filename. The
+    second one then overwrites the first one's bank with the post-restore index -- and when
+    the second restore reads *from* that rescue copy (the "I restored the wrong snapshot"
+    recovery), it overwrites its own source and silently no-ops. `create_snapshot` refuses a
+    colliding target for exactly this reason; the rescue path needs the same guard.
+    """
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    _insert_document(dbp, "b" * 64)  # live index diverges from the snapshot
+    live_before = dbp.read_bytes()
+
+    first = snapshot.restore_snapshot(dbp, target, now=NOW)
+    rescue = Path(first["rescue_copy"])
+    assert rescue.read_bytes() == live_before
+
+    second = snapshot.restore_snapshot(dbp, rescue, now=NOW)  # undo, same second
+
+    assert rescue.read_bytes() == live_before, "restore overwrote the rescue copy it read from"
+    assert second["row_counts"]["document"] == 2, "restoring the rescue copy did not undo"
+    assert Path(second["rescue_copy"]) != rescue, "each restore must bank its own rescue copy"
