@@ -69,18 +69,38 @@ of health; re-run or narrow the corpus if that matters for a given pass.
 
 ## 5. OCR (phase 4)
 
-A ladder, configured in `[ocr].ladder`, walked per page until confidence clears
-`[ocr].min_confidence`:
+A ladder, configured in `[ocr].ladder` (default `["local", "vision"]`), walked per page until
+confidence clears `[ocr].min_confidence`:
 
-1. **local** — PyMuPDF for embedded text layers, tesseract (via ocrmypdf or direct) for
-   rasterized pages. Free, private, batchable.
-2. **drive** — Google Drive's own text layer via the Drive API. Deferred until a Drive-API
-   phase exists.
-3. **vision** — the agent reads the page image and supplies text; the tool validates and
-   commits with `ocr_source = 'vision'`. Last resort, costs tokens.
+1. **local** — PyMuPDF reads embedded text layers directly; tesseract (invoked directly, no
+   ocrmypdf/Ghostscript) runs on rasterized pages, rendered into an OS temp dir. Free, private,
+   batchable.
+2. **drive** — Google Drive's own text layer via the Drive API. Reserved in config, not
+   implemented; a listed-but-unimplemented rung is skipped with a recorded reason rather than
+   erroring. Deferred until a Drive-API phase exists.
+3. **vision** — the agent reads the page image and supplies text via `filingcabinet ocr submit`;
+   the tool validates and commits with `ocr_source = 'vision'` at confidence `1.0`. Last resort,
+   costs tokens; never run automatically by `ocr run` — a page needing it is left `pending_vision`
+   for the agent to close out.
 
-Text is stored per document, FTS5-indexed, queried by `find`. Per-page confidence is recorded
-so the ladder is resumable.
+Migration `005_ocr.sql` adds `page_ocr` (one row per page: `confidence`, `rung`, `ocr_source`,
+`status` — `ok | pending_vision | skipped | exhausted`, `note` for the machine-readable reason)
+and `document_fts`, an external-content FTS5 index over `document.ocr_text` kept in sync by three
+triggers (insert/delete/update-of-`ocr_text`) that are its only writers. `document.ocr_source`
+keeps the coarse `local | drive | vision` vocabulary from §2; `page_ocr.ocr_source` is the finer
+`local_text | local_tesseract | vision`. `filingcabinet find <query> [--json]` queries the index;
+`filingcabinet doctor` reports tesseract presence/version (and PyMuPDF's) without raising when
+absent.
+
+Per-page confidence is persisted so a re-run is resumable: a page already at or above
+`min_confidence` is skipped. A page below threshold normally resumes at the rung *after* the one
+last recorded (strictly advancing, terminating in `exhausted`) — except a rung that was
+*unavailable* in the environment (tesseract missing, or an unimplemented rung name) resumes *at*
+that rung, so installing tesseract and re-running actually picks the page back up. Either way, a
+page carrying text is never blanked by a later pass that reads less (a re-escalation preserves the
+prior text/confidence/source until something better replaces it), so raising `min_confidence`
+cannot silently drop a document out of `find`. `ocr run --json` reports a `degraded` count —
+pages currently deferred for an environment reason — alongside the status counts.
 
 ## 6. Organize (phases 5-6)
 
@@ -140,9 +160,16 @@ to.
 - **pemr:** independent. Both projects use sha256 content IDs, so a later bridge (pemr
   referencing a FilingCabinet document) is a lookup, not a dependency. No shared code or DB.
 
+Security-relevant rule the OCR path (§5) upholds and any later rung (`drive`, or a toolchain
+installer) must preserve: document content never reaches a shell (tesseract runs as an argv list,
+never `shell=True`, on a code-constructed path, with a timeout) and OCR never writes under
+`[paths].root` (rasterization lands in an OS temp dir) — the same read-only-on-the-tree posture
+as ingest and dedup.
+
 ## 10. Open questions
 
 - Local-to-Drive drift that has not synced down as a file needs the Drive API. Deferred.
-- Windows OCR toolchain (tesseract, Ghostscript) install and a `doctor` verb. See
+- Windows OCR toolchain (tesseract) install remains manual (`doctor` reports presence/version,
+  landed in phase 4; an installer or `doctor --fix` is still open). See
   [Development.md](Development.md).
 - graphify over OCR text exports for cross-document entity linking. Experiment after phase 4.
