@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from filingcabinet import cli, db, dedup
+from filingcabinet import cli, db, dedup, ocr
 
 
 def test_migrate_refuses_to_create_without_flag(tmp_path):
@@ -343,3 +343,154 @@ def test_dupes_label_pair_needs_kind_and_verdict(tmp_path, capsys):
     a, b = _two_documents(dbp)
     with pytest.raises(SystemExit):
         cli.main(["--db", dbp, "dupes", "label", "--pair", str(a), str(b)])
+
+
+def test_ocr_run_json_summary(tmp_path, capsys):
+    """`a.pdf` is not really a PDF, so this also covers the unopenable-document path."""
+    dbp = _migrated_db(tmp_path, capsys)
+    root = _make_root(tmp_path)
+    assert cli.main(["--db", dbp, "--json", "ingest", "--root", str(root)]) == 0
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "--json", "ocr", "run", "--root", str(root)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ladder"] == ["local", "vision"] and out["min_confidence"] == 0.75
+    assert out["errors"] == 1 and out["documents"] == 0
+    assert all(isinstance(out[key], int) for key in ("documents", "pages", "ok", "errors"))
+
+
+def test_ocr_ladder_from_config(tmp_path, capsys):
+    dbp = _migrated_db(tmp_path, capsys)
+    root = _make_root(tmp_path)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[ocr]\nladder = ["local"]\nmin_confidence = 0.4\n')
+    assert cli.main(
+        ["--db", dbp, "--config", str(cfg), "--json", "ocr", "run", "--root", str(root)]
+    ) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ladder"] == ["local"] and out["min_confidence"] == 0.4
+
+
+def test_ocr_requires_migrated_db(tmp_path):
+    root = _make_root(tmp_path)
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(tmp_path / "fc.db"), "ocr", "run", "--root", str(root)])
+
+
+def test_ocr_submit_commits_agent_text(tmp_path, capsys):
+    dbp = _migrated_db(tmp_path, capsys)
+    document_id = _two_documents(dbp)[0]
+    text_file = tmp_path / "page.txt"
+    text_file.write_text("handwritten meter reading 41215", encoding="utf-8")
+    assert cli.main(
+        ["--db", dbp, "--json", "ocr", "submit", "--document", str(document_id),
+         "--page", "1", "--text-file", str(text_file)]
+    ) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ocr_source"] == "vision" and out["page"] == 1
+
+    assert cli.main(["--db", dbp, "--json", "find", "meter reading"]) == 0
+    hits = json.loads(capsys.readouterr().out)["hits"]
+    assert [hit["document_id"] for hit in hits] == [document_id]
+
+
+def test_ocr_submit_rejects_bad_input(tmp_path, capsys):
+    dbp = _migrated_db(tmp_path, capsys)
+    document_id = _two_documents(dbp)[0]
+    text_file = tmp_path / "page.txt"
+    text_file.write_text("   ", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        cli.main(
+            ["--db", dbp, "ocr", "submit", "--document", str(document_id),
+             "--page", "1", "--text-file", str(text_file)]
+        )
+    with pytest.raises(SystemExit):
+        cli.main(
+            ["--db", dbp, "ocr", "submit", "--document", str(document_id),
+             "--page", "1", "--text-file", str(tmp_path / "missing.txt")]
+        )
+
+
+def test_find_json_shape(tmp_path, capsys):
+    dbp = _migrated_db(tmp_path, capsys)
+    document_id = _two_documents(dbp)[0]
+    conn = db.connect(dbp)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE document SET ocr_text = ? WHERE document_id = ?",
+                ("Northwind invoice for office chairs", document_id),
+            )
+    finally:
+        conn.close()
+
+    assert cli.main(["--db", dbp, "--json", "find", "northwind", "--limit", "5"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["query"] == "northwind" and out["count"] == 1
+    hit = out["hits"][0]
+    assert set(hit) == {
+        "document_id",
+        "sha256",
+        "rel_path",
+        "mime",
+        "page_count",
+        "snippet",
+        "rank",
+    }
+    assert hit["document_id"] == document_id and "[Northwind]" in hit["snippet"]
+
+    assert cli.main(["--db", dbp, "--json", "find", "nothing-matches-this"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "query": "nothing-matches-this",
+        "count": 0,
+        "hits": [],
+    }
+
+
+def test_find_requires_migrated_db(tmp_path):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(tmp_path / "fc.db"), "find", "anything"])
+
+
+def test_doctor_json_reports_tesseract(tmp_path, capsys, monkeypatch):
+    dbp = _migrated_db(tmp_path, capsys)
+    monkeypatch.setattr(ocr, "tesseract_version", lambda: "tesseract v5.4.0")
+    assert cli.main(["--db", dbp, "--json", "doctor"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert set(out) >= {"tesseract", "pymupdf", "ladder", "min_confidence", "db", "migrated"}
+    assert out["tesseract"] == {"present": True, "version": "tesseract v5.4.0"}
+    assert out["migrated"] is True
+
+    monkeypatch.setattr(ocr, "tesseract_version", lambda: None)
+    assert cli.main(["--db", dbp, "--json", "doctor"]) == 0  # absence is a report, not a failure
+    out = json.loads(capsys.readouterr().out)
+    assert out["tesseract"] == {"present": False, "version": None}
+
+
+def test_doctor_without_a_database_still_reports(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("FC_DB", raising=False)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[paths]\n")
+    assert cli.main(["--config", str(cfg), "--json", "doctor"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert "db" not in out and out["pymupdf"]["present"] in (True, False)
+
+
+def test_ingest_unaffected_by_fts_triggers(tmp_path, capsys):
+    """The FTS update trigger is guarded, so a re-scan neither rewrites nor loses the index."""
+    dbp = _migrated_db(tmp_path, capsys)
+    root = _make_root(tmp_path)
+    assert cli.main(["--db", dbp, "--json", "ingest", "--root", str(root)]) == 0
+    capsys.readouterr()
+    conn = db.connect(dbp)
+    try:
+        with conn:
+            conn.execute("UPDATE document SET ocr_text = 'northwind invoice'")
+    finally:
+        conn.close()
+
+    assert cli.main(["--db", dbp, "--json", "ingest", "--root", str(root)]) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["unchanged"] == 1 and second["changed"] == 0
+
+    assert cli.main(["--db", dbp, "--json", "find", "northwind"]) == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 1
