@@ -1,6 +1,6 @@
 """`filingcabinet` (alias `fc`) command-line entry point.
 
-Verbs: migrate, status, ingest, dupes, snapshot, restore, instance.
+Verbs: migrate, status, ingest, ocr, find, doctor, dupes, snapshot, restore, instance.
 
 DB path resolution: --db flag > FC_DB env var > config.toml [paths].data_dir + /filingcabinet.db.
 Config path resolution: --config flag > FC_CONFIG env var > ./config.toml.
@@ -22,6 +22,8 @@ from . import (
     dedup as dedup_mod,
     ingest as ingest_mod,
     instance as instance_mod,
+    ocr as ocr_mod,
+    search as search_mod,
     snapshot as snapshot_mod,
 )
 
@@ -305,6 +307,117 @@ def cmd_dupes_label(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_ocr_config(args: argparse.Namespace) -> ocr_mod.OcrConfig:
+    """Ladder and threshold from `[ocr]`; a missing or malformed table falls back to defaults."""
+    return ocr_mod.OcrConfig.from_mapping(load_config(args.config).get("ocr"))
+
+
+def cmd_ocr_run(args: argparse.Namespace) -> int:
+    db_path = _require_database(args)
+    root = resolve_root(args)
+    config = _resolve_ocr_config(args)
+    conn = db.connect(db_path)
+    try:
+        summary = ocr_mod.run_ocr(conn, root, config=config, limit=args.limit)
+    finally:
+        conn.close()
+    payload = {
+        "db": str(db_path),
+        "root": str(root),
+        "ladder": list(config.ladder),
+        "min_confidence": config.min_confidence,
+        **summary.as_dict(),
+    }
+    _emit(
+        args,
+        payload,
+        f"{root}: {summary.documents} document(s), {summary.pages} page(s) - {summary.ok} ok, "
+        f"{summary.pending_vision} pending vision, {summary.skipped} skipped, "
+        f"{summary.exhausted} exhausted, {summary.errors} error(s)",
+    )
+    return 0
+
+
+def _read_submitted_text(args: argparse.Namespace) -> str:
+    if args.text_file == "-":
+        return sys.stdin.read()
+    path = Path(args.text_file)
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise SystemExit(f"error: cannot read {path}: {exc}") from exc
+
+
+def cmd_ocr_submit(args: argparse.Namespace) -> int:
+    db_path = _require_database(args)
+    text = _read_submitted_text(args)
+    conn = db.connect(db_path)
+    try:
+        result = ocr_mod.submit_vision_text(conn, args.document, args.page, text)
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    finally:
+        conn.close()
+    _emit(
+        args,
+        {"db": str(db_path), **result},
+        f"document {result['document_id']} page {result['page']}: "
+        f"{result['chars']} character(s) committed as vision",
+    )
+    return 0
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    db_path = _require_database(args)
+    conn = db.connect(db_path)
+    try:
+        hits = search_mod.find(conn, args.query, limit=args.limit or search_mod.DEFAULT_LIMIT)
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    finally:
+        conn.close()
+    payload = {"query": args.query, "count": len(hits), "hits": [hit.as_dict() for hit in hits]}
+    text = "\n".join(
+        f"{hit.rel_path or hit.sha256[:12]} - {hit.snippet}" for hit in hits
+    ) or "no matches"
+    _emit(args, payload, text)
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Report the OCR toolchain. Absence is a report, not a failure: always exits 0."""
+    tesseract = ocr_mod.tesseract_version()
+    pymupdf = ocr_mod.pymupdf_version()
+    config = _resolve_ocr_config(args)
+    payload = {
+        "tesseract": {"present": tesseract is not None, "version": tesseract},
+        "pymupdf": {"present": pymupdf is not None, "version": pymupdf},
+        "ladder": list(config.ladder),
+        "min_confidence": config.min_confidence,
+    }
+    try:  # the db is optional here - doctor reports the toolchain either way
+        db_path = resolve_db_path(args)
+    except SystemExit:
+        db_path = None
+    if db_path is not None and db.database_exists(db_path):
+        conn = db.connect(db_path)
+        try:
+            payload["db"] = str(db_path)
+            payload["migrated"] = db.is_migrated(conn)
+        finally:
+            conn.close()
+    elif db_path is not None:
+        payload["db"] = str(db_path)
+        payload["migrated"] = False
+    _emit(
+        args,
+        payload,
+        f"tesseract: {tesseract or 'not found'}\npymupdf: {pymupdf or 'not found'}\n"
+        f"ladder: {', '.join(config.ladder)} (min_confidence {config.min_confidence})",
+    )
+    return 0
+
+
 def cmd_instance_init(args: argparse.Namespace) -> int:
     try:
         result = instance_mod.init_instance(Path(args.dir), force=args.force)
@@ -351,6 +464,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target", help="`latest` or the path to a snapshot file")
     p.add_argument("--dry-run", action="store_true", help="validate and report, change nothing")
     p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("ocr", help="run the OCR ladder, or commit agent-supplied text")
+    ocr_sub = p.add_subparsers(dest="ocr_command", required=True)
+    q = ocr_sub.add_parser("run", help="walk the [ocr].ladder over indexed documents")
+    q.add_argument("--root", help="document root (overrides FC_ROOT and config)")
+    q.add_argument("--limit", type=int, help="cap the number of documents processed")
+    q.set_defaults(func=cmd_ocr_run)
+    q = ocr_sub.add_parser("submit", help="commit agent-supplied text for one page (vision rung)")
+    q.add_argument("--document", type=int, required=True, help="document_id")
+    q.add_argument("--page", type=int, required=True, help="1-based page number")
+    q.add_argument("--text-file", required=True, help="file holding the page text, or - for stdin")
+    q.set_defaults(func=cmd_ocr_submit)
+
+    p = sub.add_parser("find", help="full-text search over OCR text")
+    p.add_argument("query", help="search terms (FTS5 syntax is honoured when present)")
+    p.add_argument("--limit", type=int, help="maximum hits to return")
+    p.set_defaults(func=cmd_find)
+
+    p = sub.add_parser("doctor", help="report the OCR toolchain (tesseract, PyMuPDF)")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("dupes", help="duplicate detection: report tiers, label the sample")
     dupes_sub = p.add_subparsers(dest="dupes_command", required=True)
