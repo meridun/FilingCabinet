@@ -1,6 +1,7 @@
 """`filingcabinet` (alias `fc`) command-line entry point.
 
-Verbs: migrate, status, ingest, ocr, find, doctor, dupes, snapshot, restore, instance.
+Verbs: migrate, status, ingest, ocr, find, propose, classify, doctor, dupes, snapshot,
+restore, instance.
 
 DB path resolution: --db flag > FC_DB env var > config.toml [paths].data_dir + /filingcabinet.db.
 Config path resolution: --config flag > FC_CONFIG env var > ./config.toml.
@@ -23,11 +24,15 @@ from . import (
     ingest as ingest_mod,
     instance as instance_mod,
     ocr as ocr_mod,
+    organize as organize_mod,
     search as search_mod,
     snapshot as snapshot_mod,
+    taxonomy as taxonomy_mod,
 )
 
 DB_FILENAME = "filingcabinet.db"
+TAXONOMY_FILENAME = "taxonomy.toml"
+DEFAULT_PLAN_DIRNAME = "plans"
 
 
 def load_config(config_arg: str | None) -> dict:
@@ -83,6 +88,66 @@ def resolve_snapshot_dir(args: argparse.Namespace) -> Path:
             "[paths].snapshot_dir in config.toml (see config.example.toml)"
         )
     return Path(snapshot_dir)
+
+
+def resolve_taxonomy_path(args: argparse.Namespace) -> Path:
+    """Taxonomy: --taxonomy > FC_TAXONOMY > config [paths].taxonomy > taxonomy.toml beside it.
+
+    A missing file is not an error - `filingcabinet.taxonomy.load_taxonomy` reads it as an empty
+    taxonomy, so every document routes to the agent instead of the run failing.
+    """
+    taxonomy_path = getattr(args, "taxonomy", None) or os.environ.get("FC_TAXONOMY")
+    if taxonomy_path:
+        return Path(taxonomy_path)
+    configured = load_config(args.config).get("paths", {}).get("taxonomy")
+    if configured:
+        return Path(configured)
+    config_path = Path(args.config or os.environ.get("FC_CONFIG") or "config.toml")
+    return config_path.parent / TAXONOMY_FILENAME
+
+
+def resolve_plan_dir(args: argparse.Namespace, root: Path) -> Path:
+    """Plan dir: --out's parent > --plan-dir > FC_PLAN_DIR > config [paths].plan_dir > data_dir.
+
+    Never under ``[paths].root``: a plan file is not a document, and writing one into the tree
+    would be an unasked write to the corpus (docs/Architecture.md section 6).
+    """
+    out = getattr(args, "out", None)
+    if out:
+        plan_dir = Path(out).parent
+    else:
+        configured = (
+            getattr(args, "plan_dir", None)
+            or os.environ.get("FC_PLAN_DIR")
+            or load_config(args.config).get("paths", {}).get("plan_dir")
+        )
+        plan_dir = (
+            Path(configured) if configured else resolve_db_path(args).parent / DEFAULT_PLAN_DIRNAME
+        )
+    resolved_root = root.resolve()
+    probe = plan_dir if plan_dir.is_absolute() else Path.cwd() / plan_dir
+    try:
+        inside = probe.resolve().is_relative_to(resolved_root)
+    except (OSError, ValueError):  # pragma: no cover - an unresolvable path is "outside"
+        inside = False
+    if inside:
+        raise SystemExit(
+            f"error: plan directory {plan_dir} is inside the document root {root} - plans are "
+            "proposals, not documents; set [paths].plan_dir outside the root"
+        )
+    return plan_dir
+
+
+def _resolve_naming_template(args: argparse.Namespace) -> str:
+    """Naming template: [naming].template > the built-in default."""
+    configured = load_config(args.config).get("naming", {}).get("template")
+    if configured is None:
+        return organize_mod.DEFAULT_TEMPLATE
+    if not isinstance(configured, str) or not configured.strip():
+        raise SystemExit(
+            f"error: [naming].template must be a non-empty string, got {configured!r}"
+        )
+    return configured
 
 
 def _emit(args: argparse.Namespace, payload: dict, text: str) -> None:
@@ -385,6 +450,103 @@ def cmd_find(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_propose(args: argparse.Namespace) -> int:
+    """Build a rename/move *plan*. Writes exactly one file, and never under the document root.
+
+    `apply` is phase 6's verb; this one proposes (docs/Architecture.md section 6). An
+    all-unclassified corpus is a report, not a failure - the exit code stays 0, `doctor`'s rule.
+    """
+    db_path = _require_database(args)
+    root = resolve_root(args)
+    taxonomy_path = resolve_taxonomy_path(args)
+    template = _resolve_naming_template(args)
+    taxonomy = taxonomy_mod.load_taxonomy(taxonomy_path)
+
+    plan_dir = resolve_plan_dir(args, root)  # guards --out and --plan-dir alike, before any work
+    conn = db.connect(db_path)
+    try:
+        entries, summary = organize_mod.build_plan(
+            conn,
+            root,
+            taxonomy=taxonomy,
+            template=template,
+            limit=args.limit,
+            document_id=args.document,
+        )
+    finally:
+        conn.close()
+
+    plan_id = organize_mod.new_plan_id()
+    plan_path = None
+    if not args.dry_run:
+        target = Path(args.out) if args.out else plan_dir / f"{plan_id}.json"
+        try:
+            plan_path = organize_mod.write_plan(
+                entries,
+                summary,
+                target,
+                plan_id=plan_id,
+                root=root,
+                taxonomy_path=taxonomy_path,
+                template=template,
+            )
+        except OSError as exc:
+            raise SystemExit(f"error: cannot write plan to {target}: {exc}") from exc
+
+    payload = {
+        "db": str(db_path),
+        "root": str(root),
+        "taxonomy": str(taxonomy_path),
+        "template": template,
+        "plan_id": plan_id,
+        "plan": str(plan_path) if plan_path else None,
+        "dry_run": bool(args.dry_run),
+        **summary.as_dict(),
+        "entries": [entry.as_dict() for entry in entries],
+    }
+    _emit(
+        args,
+        payload,
+        f"{root}: {summary.documents} document(s) - {summary.move} move, {summary.noop} noop, "
+        f"{summary.unclassified} unclassified, {summary.collision} collision, "
+        f"{summary.errors} error(s); {summary.rule_matched} by rule, "
+        f"{summary.agent_matched} by agent\n"
+        f"plan: {plan_path if plan_path else 'not written (--dry-run)'}",
+    )
+    return 0
+
+
+def cmd_classify(args: argparse.Namespace) -> int:
+    """Record one agent verdict for a document the taxonomy rules could not classify."""
+    db_path = _require_database(args)
+    conn = db.connect(db_path)
+    try:
+        verdict = organize_mod.record_agent_classification(
+            conn,
+            args.document,
+            party=args.party,
+            doc_type=args.doc_type,
+            detail=args.detail,
+            doc_date=args.doc_date,
+            folder=args.folder,
+            tags=args.tag or (),
+            note=args.note,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    finally:
+        conn.close()
+    stanza = organize_mod.suggested_rule(verdict)
+    _emit(
+        args,
+        {"db": str(db_path), **verdict, "suggested_rule": stanza},
+        f"document {verdict['document_id']}: recorded agent verdict "
+        f"({verdict['party'] or '-'} / {verdict['doc_type'] or '-'})\n"
+        f"promote it into taxonomy.toml by pasting:\n{stanza}",
+    )
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report the OCR toolchain. Absence is a report, not a failure: always exits 0."""
     tesseract = ocr_mod.tesseract_version()
@@ -483,6 +645,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, help="maximum hits to return")
     p.set_defaults(func=cmd_find)
 
+    p = sub.add_parser(
+        "propose", help="plan renames/moves from the taxonomy; writes no file under the root"
+    )
+    p.add_argument("--root", help="document root (overrides FC_ROOT and config)")
+    p.add_argument("--taxonomy", help="taxonomy.toml path (overrides FC_TAXONOMY and config)")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--plan-dir", help="directory for the plan file (never inside the root)")
+    group.add_argument("--out", help="exact plan file path (never inside the root)")
+    p.add_argument("--limit", type=int, help="cap the number of documents planned")
+    p.add_argument("--document", type=int, help="plan a single document_id")
+    p.add_argument("--dry-run", action="store_true", help="report the plan, write no file")
+    p.set_defaults(func=cmd_propose)
+
+    p = sub.add_parser("classify", help="record an agent verdict for one document")
+    p.add_argument("--document", type=int, required=True, help="document_id")
+    p.add_argument("--party", help="vendor / person / institution")
+    p.add_argument("--doc-type", dest="doc_type", help="controlled vocabulary from the taxonomy")
+    p.add_argument("--detail", help="free-text detail for the filename")
+    p.add_argument("--doc-date", dest="doc_date", help="ISO YYYY-MM-DD")
+    p.add_argument("--folder", help="proposed folder, relative to the document root")
+    p.add_argument("--tag", action="append", help="tag (repeatable)")
+    p.add_argument("--note", help="why the agent decided this")
+    p.set_defaults(func=cmd_classify)
+
     p = sub.add_parser("doctor", help="report the OCR toolchain (tesseract, PyMuPDF)")
     p.set_defaults(func=cmd_doctor)
 
@@ -521,7 +707,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (db.NotMigratedError, snapshot_mod.SnapshotError) as exc:
+    except (
+        db.NotMigratedError,
+        snapshot_mod.SnapshotError,
+        taxonomy_mod.TaxonomyError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

@@ -19,11 +19,12 @@ TEMPLATES: dict[str, str] = {
     ".gitignore": "gitignore.tmpl",
     "CLAUDE.md": "CLAUDE.md.tmpl",
     "config.toml": "config.example.toml",
+    "taxonomy.toml": "taxonomy.example.toml",
 }
 
-# config.toml is copied verbatim: its body contains {doc_date}-style braces that are not
-# placeholders and must survive untouched.
-VERBATIM = frozenset({"config.example.toml"})
+# These are copied verbatim: their bodies contain {doc_date}-style braces and regex escapes
+# that are not placeholders and must survive untouched.
+VERBATIM = frozenset({"config.example.toml", "taxonomy.example.toml"})
 
 
 def read_template(name: str) -> str:

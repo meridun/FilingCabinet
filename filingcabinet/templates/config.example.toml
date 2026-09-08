@@ -13,9 +13,15 @@ root = 'C:\Users\you\My Drive\Documents'
 inbox = 'C:\Users\you\My Drive\Documents\_inbox'
 data_dir = 'C:\filingcabinet-data'
 snapshot_dir = 'C:\Users\you\My Drive\filingcabinet\snapshots'
+# taxonomy is the deterministic rules file (see taxonomy.toml); it defaults to taxonomy.toml
+# beside this config. plan_dir holds `propose` plan files and must be OUTSIDE root: plans are
+# proposals, never applied automatically, and a plan file is not a document.
+taxonomy = 'taxonomy.toml'
+plan_dir = 'C:\filingcabinet-data\plans'
 
 [naming]
-# Python format template over document fields. Missing fields drop with their separator.
+# Template over document fields, rendered by `propose`. Unresolved fields drop together
+# with their preceding separator: no detail gives 2026-02-03_Northwind_invoice.
 # Refine from real examples (phase 5).
 template = "{doc_date}_{party}_{doc_type}_{detail}"
 
