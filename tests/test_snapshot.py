@@ -1,3 +1,7 @@
+import sqlite3
+import subprocess
+import sys
+import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -175,6 +179,60 @@ def test_restore_banks_rescue_copy_and_clears_sidecars(tmp_path):
     assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 1
     conn.close()
 
+
+def _crash_write_document(path: Path, sha: str) -> None:
+    """Commit a row from a process that dies before SQLite can checkpoint.
+
+    The commit lands in ``<db>-wal`` and the main database file never sees it - what a
+    killed `fc` run or a power cut leaves behind, and exactly the "stale sidecar" state
+    `restore` exists to clear.
+    """
+    stamp = NOW.isoformat(timespec="seconds")
+    code = textwrap.dedent(
+        f"""
+        import os, sqlite3
+        conn = sqlite3.connect({str(path)!r})
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "INSERT INTO document (sha256, size_bytes, first_seen_at, updated_at)"
+            " VALUES (?, ?, ?, ?)",
+            ({sha!r}, {len(sha)}, {stamp!r}, {stamp!r}),
+        )
+        conn.commit()
+        os._exit(0)
+        """
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_rescue_copy_keeps_committed_rows_still_in_the_wal(tmp_path):
+    """The rescue copy must hold everything the replaced index held.
+
+    That includes transactions committed to the ``-wal`` restore is about to delete: a raw
+    file copy of a WAL-mode database does not carry them, which the module docstring
+    already says about snapshots. The rescue copy is the same problem, on the undo path.
+    """
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    _crash_write_document(dbp, "b" * 64)
+
+    wal = Path(str(dbp) + "-wal")
+    assert wal.is_file(), "precondition: the crashed writer left a -wal"
+    assert ("b" * 64).encode() not in dbp.read_bytes(), "precondition: commit is wal-only"
+
+    result = snapshot.restore_snapshot(dbp, target, now=NOW)
+
+    assert not wal.exists(), "restore clears the stale sidecar (AC)"
+    rescue = Path(result["rescue_copy"])
+    conn = sqlite3.connect(f"file:{rescue.as_posix()}?mode=ro", uri=True)
+    try:
+        kept = conn.execute(
+            "SELECT COUNT(*) FROM document WHERE sha256 = ?", ("b" * 64,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert kept == 1, "rescue copy lost a committed row that lived only in the -wal"
 
 def test_restore_without_live_db_records_no_rescue_copy(tmp_path):
     dbp = _migrated_db(tmp_path / "fc.db")
