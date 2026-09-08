@@ -1,3 +1,4 @@
+import argparse
 import json
 from pathlib import Path
 
@@ -502,3 +503,293 @@ def test_ingest_unaffected_by_fts_triggers(tmp_path, capsys):
 
     assert cli.main(["--db", dbp, "--json", "find", "northwind"]) == 0
     assert json.loads(capsys.readouterr().out)["count"] == 1
+
+
+# --- propose / classify (phase 5) --------------------------------------------------------
+
+TAXONOMY_TOML = """
+version = 1
+doc_types = ["invoice"]
+
+[parties.northwind]
+display = "Northwind"
+aliases = ["northwind ltd"]
+
+[[rules]]
+id = "northwind-invoice"
+party = "northwind"
+doc_type = "invoice"
+any = ["invoice"]
+folder = "Suppliers/Northwind"
+priority = 100
+"""
+
+
+def _propose_fixture(tmp_path, monkeypatch, text=b"Northwind invoice no 7"):
+    """A migrated index over a one-document root, plus a taxonomy file. Returns (db, root, tax)."""
+    for name in ("FC_ROOT", "FC_DB", "FC_TAXONOMY", "FC_PLAN_DIR", "FC_CONFIG"):
+        monkeypatch.delenv(name, raising=False)
+    dbp = str(tmp_path / "fc.db")
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "scan.pdf").write_bytes(text)
+    tax = tmp_path / "taxonomy.toml"
+    tax.write_text(TAXONOMY_TOML, encoding="utf-8")
+    assert cli.main(["--db", dbp, "migrate", "--create"]) == 0
+    assert cli.main(["--db", dbp, "ingest", "--root", str(root)]) == 0
+    # ocr_text is phase 4's job; set it directly so the phase-5 tests do not need PyMuPDF.
+    conn = db.connect(dbp)
+    conn.execute("UPDATE document SET ocr_text = ?", ("Northwind invoice no 7 dated 2026-02-03",))
+    conn.commit()
+    conn.close()
+    return dbp, root, tax
+
+
+def test_propose_json_shape_and_plan_file(tmp_path, monkeypatch, capsys):
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    plan_dir = tmp_path / "plans"
+    capsys.readouterr()
+    assert cli.main([
+        "--db", dbp, "--json", "propose", "--root", str(root),
+        "--taxonomy", str(tax), "--plan-dir", str(plan_dir),
+    ]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert {"db", "root", "taxonomy", "taxonomy_exists", "taxonomy_rules", "template",
+            "plan_id", "plan", "dry_run", "documents",
+            "move", "noop", "unclassified", "collision", "errors", "rule_matched",
+            "agent_matched", "entries"} <= set(out)
+    entry = out["entries"][0]
+    assert entry["provenance"] == "rule" and entry["rule_id"] == "northwind-invoice"
+    assert entry["target_path"] == "Suppliers/Northwind/2026-02-03_Northwind_invoice.pdf"
+    assert out["move"] == 1 and out["rule_matched"] == 1
+    written = json.loads(Path(out["plan"]).read_text(encoding="utf-8"))
+    assert written["plan_version"] == 1 and written["plan_id"] == out["plan_id"]
+
+
+def test_propose_exits_zero_on_an_all_unclassified_corpus(tmp_path, monkeypatch, capsys):
+    dbp, root, _ = _propose_fixture(tmp_path, monkeypatch)
+    conn = db.connect(dbp)
+    conn.execute("UPDATE document SET ocr_text = 'nothing recognisable'")
+    conn.commit()
+    conn.close()
+    capsys.readouterr()
+    assert cli.main([
+        "--db", dbp, "--json", "propose", "--root", str(root),
+        "--taxonomy", str(tmp_path / "absent.toml"), "--plan-dir", str(tmp_path / "plans"),
+    ]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["unclassified"] == 1 and out["move"] == 0
+
+
+def test_propose_dry_run_writes_no_file(tmp_path, monkeypatch, capsys):
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    plan_dir = tmp_path / "plans"
+    capsys.readouterr()
+    assert cli.main([
+        "--db", dbp, "--json", "propose", "--root", str(root), "--taxonomy", str(tax),
+        "--plan-dir", str(plan_dir), "--dry-run",
+    ]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["dry_run"] is True and out["plan"] is None
+    assert not plan_dir.exists()
+
+
+def test_propose_never_touches_the_document_tree(tmp_path, monkeypatch, capsys):
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    before = sorted(p.name for p in root.rglob("*"))
+    capsys.readouterr()
+    assert cli.main([
+        "--db", dbp, "--json", "propose", "--root", str(root), "--taxonomy", str(tax),
+        "--plan-dir", str(tmp_path / "plans"),
+    ]) == 0
+    assert sorted(p.name for p in root.rglob("*")) == before
+
+
+def test_propose_refuses_a_plan_dir_inside_the_document_root(tmp_path, monkeypatch, capsys):
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        cli.main([
+            "--db", dbp, "propose", "--root", str(root), "--taxonomy", str(tax),
+            "--plan-dir", str(root / "plans"),
+        ])
+    assert "inside the document root" in str(exc.value)
+
+
+def test_propose_refuses_an_out_path_inside_the_document_root(tmp_path, monkeypatch):
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        cli.main([
+            "--db", dbp, "propose", "--root", str(root), "--taxonomy", str(tax),
+            "--out", str(root / "plan.json"),
+        ])
+    assert "inside the document root" in str(exc.value)
+
+
+def test_propose_requires_a_migrated_db(tmp_path, monkeypatch):
+    monkeypatch.delenv("FC_DB", raising=False)
+    root = tmp_path / "docs"
+    root.mkdir()
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(tmp_path / "fc.db"), "propose", "--root", str(root)])
+
+
+def test_taxonomy_path_precedence(tmp_path, monkeypatch, capsys):
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    env_tax = tmp_path / "env.toml"
+    env_tax.write_text(TAXONOMY_TOML, encoding="utf-8")
+    cfg_tax = tmp_path / "cfg.toml"
+    cfg_tax.write_text(TAXONOMY_TOML, encoding="utf-8")
+    plan_dir = (tmp_path / "p").as_posix()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        f"[paths]\ntaxonomy = '{cfg_tax.as_posix()}'\nplan_dir = '{plan_dir}'\n",
+        encoding="utf-8",
+    )
+
+    def taxonomy_used(*extra):
+        capsys.readouterr()
+        assert cli.main(["--db", dbp, "--config", str(cfg), "--json", "propose",
+                         "--root", str(root), "--dry-run", *extra]) == 0
+        return json.loads(capsys.readouterr().out)["taxonomy"]
+
+    assert taxonomy_used("--taxonomy", str(tax)) == str(tax)  # flag wins
+    monkeypatch.setenv("FC_TAXONOMY", str(env_tax))
+    assert taxonomy_used("--taxonomy", str(tax)) == str(tax)  # flag still wins
+    assert taxonomy_used() == str(env_tax)  # env beats config
+    monkeypatch.delenv("FC_TAXONOMY")
+    assert taxonomy_used() == str(cfg_tax)  # config last
+
+
+def test_config_relative_paths_resolve_beside_the_config_file(tmp_path, monkeypatch):
+    """Relative [paths] values mean "beside config.toml", not "beside the shell's cwd" (#18)."""
+    for name in ("FC_ROOT", "FC_DB", "FC_TAXONOMY", "FC_PLAN_DIR", "FC_CONFIG",
+                 "FC_SNAPSHOT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    instance = tmp_path / "instance"
+    (instance / "docs").mkdir(parents=True)
+    (instance / "data").mkdir()
+    (instance / "taxonomy.toml").write_text(TAXONOMY_TOML, encoding="utf-8")
+    cfg = instance / "config.toml"
+    cfg.write_text(
+        "[paths]\nroot = 'docs'\ndata_dir = 'data'\nsnapshot_dir = 'snapshots'\n"
+        "taxonomy = 'taxonomy.toml'\nplan_dir = 'plans'\n",
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)  # the failure this covers only shows up away from the config
+    args = argparse.Namespace(config=str(cfg), db=None, root=None, snapshot_dir=None,
+                              taxonomy=None, plan_dir=None, out=None)
+
+    assert cli.resolve_taxonomy_path(args) == (instance / "taxonomy.toml").resolve()
+    assert cli.resolve_db_path(args) == (instance / "data").resolve() / cli.DB_FILENAME
+    assert cli.resolve_root(args) == (instance / "docs").resolve()
+    assert cli.resolve_snapshot_dir(args) == (instance / "snapshots").resolve()
+    assert cli.resolve_plan_dir(args, instance / "docs") == (instance / "plans").resolve()
+
+    # An absent [paths].taxonomy still defaults to taxonomy.toml beside the config file.
+    cfg.write_text("[paths]\nroot = 'docs'\n", encoding="utf-8")
+    assert cli.resolve_taxonomy_path(args) == (instance / "taxonomy.toml").resolve()
+
+    # A flag is a shell input: it stays relative to the working directory, made absolute.
+    (elsewhere / "local.toml").write_text(TAXONOMY_TOML, encoding="utf-8")
+    args.taxonomy = "local.toml"
+    assert cli.resolve_taxonomy_path(args) == (elsewhere / "local.toml").resolve()
+
+
+def test_propose_from_another_cwd_loads_the_config_relative_taxonomy(
+    tmp_path, monkeypatch, capsys
+):
+    """The scaffolded `taxonomy = 'taxonomy.toml'` must classify from any cwd (#18)."""
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        f"[paths]\nroot = '{root.name}'\ntaxonomy = 'taxonomy.toml'\nplan_dir = 'plans'\n",
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "--config", str(cfg), "--json", "propose", "--dry-run"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["taxonomy"] == str(tax.resolve())
+    assert out["taxonomy_exists"] is True and out["taxonomy_rules"] == 1
+    assert out["rule_matched"] == 1 and out["unclassified"] == 0
+    assert not (elsewhere / "taxonomy.toml").exists()  # nothing was created in the cwd
+
+
+def test_propose_reports_the_taxonomy_it_loaded(tmp_path, monkeypatch, capsys):
+    """An all-unclassified run caused by a missing rules file must be explainable (#18)."""
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    absent = tmp_path / "absent.toml"
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "propose", "--root", str(root), "--taxonomy", str(absent),
+                     "--plan-dir", str(tmp_path / "plans")]) == 0
+    assert f"taxonomy: {absent.resolve()} (missing, 0 rules)" in capsys.readouterr().out
+
+    assert cli.main(["--db", dbp, "propose", "--root", str(root), "--taxonomy", str(tax),
+                     "--plan-dir", str(tmp_path / "plans")]) == 0
+    assert f"taxonomy: {tax.resolve()} (1 rule(s))" in capsys.readouterr().out
+
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "--json", "propose", "--root", str(root), "--taxonomy",
+                     str(absent), "--dry-run", "--plan-dir", str(tmp_path / "plans")]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["taxonomy"] == str(absent.resolve())
+    assert out["taxonomy_exists"] is False and out["taxonomy_rules"] == 0
+    assert out["unclassified"] == 1
+
+
+def test_malformed_taxonomy_exits_two_without_a_traceback(tmp_path, monkeypatch, capsys):
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    tax.write_text('version = 1\n\n[[rules]]\nid = "r"\nregex = "(["\n', encoding="utf-8")
+    assert cli.main(["--db", dbp, "propose", "--root", str(root), "--taxonomy", str(tax),
+                     "--plan-dir", str(tmp_path / "plans")]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error: ") and "Traceback" not in captured.err
+
+
+def test_naming_template_from_config_and_a_bad_value(tmp_path, monkeypatch, capsys):
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[naming]\ntemplate = "{party}-{doc_type}"\n', encoding="utf-8")
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "--config", str(cfg), "--json", "propose", "--root", str(root),
+                     "--taxonomy", str(tax), "--dry-run", "--plan-dir", str(tmp_path / "p")]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["template"] == "{party}-{doc_type}"
+    assert out["entries"][0]["target_name"] == "Northwind-invoice.pdf"
+
+    cfg.write_text("[naming]\ntemplate = 5\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--db", dbp, "--config", str(cfg), "propose", "--root", str(root),
+                  "--taxonomy", str(tax), "--dry-run"])
+    assert "[naming].template" in str(exc.value)
+
+
+def test_classify_records_a_verdict_and_prints_a_rule_stanza(tmp_path, monkeypatch, capsys):
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    conn = db.connect(dbp)
+    document_id = conn.execute("SELECT document_id FROM document").fetchone()["document_id"]
+    conn.close()
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "--json", "classify", "--document", str(document_id),
+                     "--party", "Acme Mutual", "--doc-type", "policy", "--tag", "insurance",
+                     "--note", "letterhead"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["provenance"] == "agent" and out["tags"] == ["insurance"]
+    assert out["suggested_rule"].startswith("[[rules]]")
+
+    # The verdict now outranks the rule that would otherwise have matched.
+    assert cli.main(["--db", dbp, "--json", "propose", "--root", str(root), "--taxonomy",
+                     str(tax), "--dry-run", "--plan-dir", str(tmp_path / "p")]) == 0
+    entry = json.loads(capsys.readouterr().out)["entries"][0]
+    assert entry["provenance"] == "agent" and "Acme_Mutual" in entry["target_name"]
+
+
+def test_classify_rejects_an_unknown_document(tmp_path, monkeypatch):
+    dbp, _, _ = _propose_fixture(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--db", dbp, "classify", "--document", "9999", "--party", "Acme"])
+    assert "no document" in str(exc.value)

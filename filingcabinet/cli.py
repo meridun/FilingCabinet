@@ -1,9 +1,12 @@
 """`filingcabinet` (alias `fc`) command-line entry point.
 
-Verbs: migrate, status, ingest, ocr, find, doctor, dupes, snapshot, restore, instance.
+Verbs: migrate, status, ingest, ocr, find, propose, classify, doctor, dupes, snapshot,
+restore, instance.
 
 DB path resolution: --db flag > FC_DB env var > config.toml [paths].data_dir + /filingcabinet.db.
 Config path resolution: --config flag > FC_CONFIG env var > ./config.toml.
+A relative path inside `[paths]` resolves against the directory holding that config file; flags
+and environment variables are shell inputs and stay relative to the working directory.
 Every verb supports --json so agents (and the phase-7 MCP wrapper) get structured output.
 """
 
@@ -23,15 +26,37 @@ from . import (
     ingest as ingest_mod,
     instance as instance_mod,
     ocr as ocr_mod,
+    organize as organize_mod,
     search as search_mod,
     snapshot as snapshot_mod,
+    taxonomy as taxonomy_mod,
 )
 
 DB_FILENAME = "filingcabinet.db"
+TAXONOMY_FILENAME = "taxonomy.toml"
+DEFAULT_PLAN_DIRNAME = "plans"
+
+
+def config_file_path(config_arg: str | None) -> Path:
+    """Config path resolution: --config flag > FC_CONFIG env var > ./config.toml."""
+    return Path(config_arg or os.environ.get("FC_CONFIG") or "config.toml")
+
+
+def config_relative(value: str, config_arg: str | None) -> Path:
+    """Resolve a `[paths]` value against the config file's directory, not the working directory.
+
+    A config file is read from a fixed place, so a relative value inside it means "beside this
+    file" - which is what config.example.toml already promises. Flags and environment variables
+    are shell inputs and keep their working-directory-relative meaning.
+    """
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (config_file_path(config_arg).parent / path).resolve()
 
 
 def load_config(config_arg: str | None) -> dict:
-    config_path = Path(config_arg or os.environ.get("FC_CONFIG") or "config.toml")
+    config_path = config_file_path(config_arg)
     if config_path.is_file():
         with config_path.open("rb") as fh:
             return tomllib.load(fh)
@@ -47,7 +72,7 @@ def resolve_db_path(args: argparse.Namespace) -> Path:
     config = load_config(args.config)
     data_dir = config.get("paths", {}).get("data_dir")
     if data_dir:
-        return Path(data_dir) / DB_FILENAME
+        return config_relative(data_dir, args.config) / DB_FILENAME
     raise SystemExit(
         "error: no database path - pass --db, set FC_DB, or set [paths].data_dir in "
         "config.toml (see config.example.toml)"
@@ -55,34 +80,106 @@ def resolve_db_path(args: argparse.Namespace) -> Path:
 
 
 def resolve_root(args: argparse.Namespace) -> Path:
-    """Document root resolution: --root flag > FC_ROOT env var > config.toml [paths].root."""
-    root = getattr(args, "root", None) or os.environ.get("FC_ROOT")
-    if not root:
-        config = load_config(args.config)
-        root = config.get("paths", {}).get("root")
-    if not root:
+    """Document root resolution: --root flag > FC_ROOT env var > config.toml [paths].root.
+
+    A relative `[paths].root` resolves against the config file's directory (`config_relative`).
+    """
+    supplied = getattr(args, "root", None) or os.environ.get("FC_ROOT")
+    path = Path(supplied) if supplied else None
+    if path is None:
+        configured = load_config(args.config).get("paths", {}).get("root")
+        if configured:
+            path = config_relative(configured, args.config)
+    if path is None:
         raise SystemExit(
             "error: no document root - pass --root, set FC_ROOT, or set [paths].root in "
             "config.toml (see config.example.toml)"
         )
-    path = Path(root)
     if not path.is_dir():
         raise SystemExit(f"error: document root {path} is not a directory")
     return path
 
 
 def resolve_snapshot_dir(args: argparse.Namespace) -> Path:
-    """Snapshot dir: --snapshot-dir flag > FC_SNAPSHOT_DIR env > config [paths].snapshot_dir."""
-    snapshot_dir = getattr(args, "snapshot_dir", None) or os.environ.get("FC_SNAPSHOT_DIR")
-    if not snapshot_dir:
-        config = load_config(args.config)
-        snapshot_dir = config.get("paths", {}).get("snapshot_dir")
-    if not snapshot_dir:
+    """Snapshot dir: --snapshot-dir flag > FC_SNAPSHOT_DIR env > config [paths].snapshot_dir.
+
+    A relative `[paths].snapshot_dir` resolves against the config file's directory.
+    """
+    supplied = getattr(args, "snapshot_dir", None) or os.environ.get("FC_SNAPSHOT_DIR")
+    if supplied:
+        return Path(supplied)
+    configured = load_config(args.config).get("paths", {}).get("snapshot_dir")
+    if not configured:
         raise SystemExit(
             "error: no snapshot directory - pass --snapshot-dir, set FC_SNAPSHOT_DIR, or set "
             "[paths].snapshot_dir in config.toml (see config.example.toml)"
         )
-    return Path(snapshot_dir)
+    return config_relative(configured, args.config)
+
+
+def resolve_taxonomy_path(args: argparse.Namespace) -> Path:
+    """Taxonomy: --taxonomy > FC_TAXONOMY > config [paths].taxonomy > taxonomy.toml beside it.
+
+    Always absolute, so `propose` can report exactly which file it read. A relative
+    `[paths].taxonomy` resolves against the config file's directory, so the scaffolded
+    `taxonomy = 'taxonomy.toml'` finds the instance's own rules from any working directory;
+    --taxonomy and FC_TAXONOMY stay working-directory-relative.
+
+    A missing file is not an error - `filingcabinet.taxonomy.load_taxonomy` reads it as an empty
+    taxonomy, so every document routes to the agent instead of the run failing - but `propose`
+    reports the path and the rule count, so an all-unclassified run is never silent.
+    """
+    supplied = getattr(args, "taxonomy", None) or os.environ.get("FC_TAXONOMY")
+    if supplied:
+        return Path(supplied).resolve()
+    configured = load_config(args.config).get("paths", {}).get("taxonomy")
+    return config_relative(configured or TAXONOMY_FILENAME, args.config)
+
+
+def resolve_plan_dir(args: argparse.Namespace, root: Path) -> Path:
+    """Plan dir: --out's parent > --plan-dir > FC_PLAN_DIR > config [paths].plan_dir > data_dir.
+
+    Never under ``[paths].root``: a plan file is not a document, and writing one into the tree
+    would be an unasked write to the corpus (docs/Architecture.md section 6). A relative
+    `[paths].plan_dir` resolves against the config file's directory.
+    """
+    out = getattr(args, "out", None)
+    supplied = getattr(args, "plan_dir", None) or os.environ.get("FC_PLAN_DIR")
+    if out:
+        plan_dir = Path(out).parent
+    elif supplied:
+        plan_dir = Path(supplied)
+    else:
+        configured = load_config(args.config).get("paths", {}).get("plan_dir")
+        plan_dir = (
+            config_relative(configured, args.config)
+            if configured
+            else resolve_db_path(args).parent / DEFAULT_PLAN_DIRNAME
+        )
+    resolved_root = root.resolve()
+    probe = plan_dir if plan_dir.is_absolute() else Path.cwd() / plan_dir
+    try:
+        inside = probe.resolve().is_relative_to(resolved_root)
+    except (OSError, ValueError):  # pragma: no cover - an unresolvable path is "outside"
+        inside = False
+    if inside:
+        raise SystemExit(
+            f"error: plan directory {plan_dir} is inside the document root {root} - plans are "
+            "proposals, not documents; set [paths].plan_dir outside the root"
+        )
+    return plan_dir
+
+
+def _resolve_naming_template(args: argparse.Namespace) -> str:
+    """Naming template: [naming].template > the built-in default."""
+    configured = load_config(args.config).get("naming", {}).get("template")
+    if configured is None:
+        return organize_mod.DEFAULT_TEMPLATE
+    if not isinstance(configured, str) or not configured.strip():
+        raise SystemExit(
+            f"error: [naming].template must be a non-empty string, got {configured!r}"
+        )
+    return configured
 
 
 def _emit(args: argparse.Namespace, payload: dict, text: str) -> None:
@@ -385,6 +482,112 @@ def cmd_find(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_propose(args: argparse.Namespace) -> int:
+    """Build a rename/move *plan*. Writes exactly one file, and never under the document root.
+
+    `apply` is phase 6's verb; this one proposes (docs/Architecture.md section 6). An
+    all-unclassified corpus is a report, not a failure - the exit code stays 0, `doctor`'s rule.
+    """
+    db_path = _require_database(args)
+    root = resolve_root(args)
+    taxonomy_path = resolve_taxonomy_path(args)
+    template = _resolve_naming_template(args)
+    taxonomy_exists = taxonomy_path.is_file()
+    taxonomy = taxonomy_mod.load_taxonomy(taxonomy_path)
+
+    plan_dir = resolve_plan_dir(args, root)  # guards --out and --plan-dir alike, before any work
+    conn = db.connect(db_path)
+    try:
+        entries, summary = organize_mod.build_plan(
+            conn,
+            root,
+            taxonomy=taxonomy,
+            template=template,
+            limit=args.limit,
+            document_id=args.document,
+        )
+    finally:
+        conn.close()
+
+    plan_id = organize_mod.new_plan_id()
+    plan_path = None
+    if not args.dry_run:
+        target = Path(args.out) if args.out else plan_dir / f"{plan_id}.json"
+        try:
+            plan_path = organize_mod.write_plan(
+                entries,
+                summary,
+                target,
+                plan_id=plan_id,
+                root=root,
+                taxonomy_path=taxonomy_path,
+                template=template,
+            )
+        except OSError as exc:
+            raise SystemExit(f"error: cannot write plan to {target}: {exc}") from exc
+
+    payload = {
+        "db": str(db_path),
+        "root": str(root),
+        "taxonomy": str(taxonomy_path),
+        "taxonomy_exists": taxonomy_exists,
+        "taxonomy_rules": len(taxonomy.rules),
+        "template": template,
+        "plan_id": plan_id,
+        "plan": str(plan_path) if plan_path else None,
+        "dry_run": bool(args.dry_run),
+        **summary.as_dict(),
+        "entries": [entry.as_dict() for entry in entries],
+    }
+    # Say which rules file was read and whether it was there: an all-unclassified run caused by a
+    # taxonomy that is simply absent must be explainable from the output alone (issue #18).
+    taxonomy_note = (
+        f"{len(taxonomy.rules)} rule(s)" if taxonomy_exists else "missing, 0 rules"
+    )
+    _emit(
+        args,
+        payload,
+        f"{root}: {summary.documents} document(s) - {summary.move} move, {summary.noop} noop, "
+        f"{summary.unclassified} unclassified, {summary.collision} collision, "
+        f"{summary.errors} error(s); {summary.rule_matched} by rule, "
+        f"{summary.agent_matched} by agent\n"
+        f"taxonomy: {taxonomy_path} ({taxonomy_note})\n"
+        f"plan: {plan_path if plan_path else 'not written (--dry-run)'}",
+    )
+    return 0
+
+
+def cmd_classify(args: argparse.Namespace) -> int:
+    """Record one agent verdict for a document the taxonomy rules could not classify."""
+    db_path = _require_database(args)
+    conn = db.connect(db_path)
+    try:
+        verdict = organize_mod.record_agent_classification(
+            conn,
+            args.document,
+            party=args.party,
+            doc_type=args.doc_type,
+            detail=args.detail,
+            doc_date=args.doc_date,
+            folder=args.folder,
+            tags=args.tag or (),
+            note=args.note,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    finally:
+        conn.close()
+    stanza = organize_mod.suggested_rule(verdict)
+    _emit(
+        args,
+        {"db": str(db_path), **verdict, "suggested_rule": stanza},
+        f"document {verdict['document_id']}: recorded agent verdict "
+        f"({verdict['party'] or '-'} / {verdict['doc_type'] or '-'})\n"
+        f"promote it into taxonomy.toml by pasting:\n{stanza}",
+    )
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report the OCR toolchain. Absence is a report, not a failure: always exits 0."""
     tesseract = ocr_mod.tesseract_version()
@@ -483,6 +686,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, help="maximum hits to return")
     p.set_defaults(func=cmd_find)
 
+    p = sub.add_parser(
+        "propose", help="plan renames/moves from the taxonomy; writes no file under the root"
+    )
+    p.add_argument("--root", help="document root (overrides FC_ROOT and config)")
+    p.add_argument("--taxonomy", help="taxonomy.toml path (overrides FC_TAXONOMY and config)")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--plan-dir", help="directory for the plan file (never inside the root)")
+    group.add_argument("--out", help="exact plan file path (never inside the root)")
+    p.add_argument("--limit", type=int, help="cap the number of documents planned")
+    p.add_argument("--document", type=int, help="plan a single document_id")
+    p.add_argument("--dry-run", action="store_true", help="report the plan, write no file")
+    p.set_defaults(func=cmd_propose)
+
+    p = sub.add_parser("classify", help="record an agent verdict for one document")
+    p.add_argument("--document", type=int, required=True, help="document_id")
+    p.add_argument("--party", help="vendor / person / institution")
+    p.add_argument("--doc-type", dest="doc_type", help="controlled vocabulary from the taxonomy")
+    p.add_argument("--detail", help="free-text detail for the filename")
+    p.add_argument("--doc-date", dest="doc_date", help="ISO YYYY-MM-DD")
+    p.add_argument("--folder", help="proposed folder, relative to the document root")
+    p.add_argument("--tag", action="append", help="tag (repeatable)")
+    p.add_argument("--note", help="why the agent decided this")
+    p.set_defaults(func=cmd_classify)
+
     p = sub.add_parser("doctor", help="report the OCR toolchain (tesseract, PyMuPDF)")
     p.set_defaults(func=cmd_doctor)
 
@@ -521,7 +748,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (db.NotMigratedError, snapshot_mod.SnapshotError) as exc:
+    except (
+        db.NotMigratedError,
+        snapshot_mod.SnapshotError,
+        taxonomy_mod.TaxonomyError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

@@ -1,0 +1,73 @@
+# FilingCabinet taxonomy - deterministic classification rules (docs/Architecture.md section 6).
+#
+# This file lives in YOUR instance repo, never in the framework repo: it names real vendors and
+# is your data. The names below are synthetic placeholders - replace them.
+#
+# How `propose` uses it:
+#   1. Rules run first, in (priority descending, id ascending) order. The first rule that matches
+#      a document's OCR text wins, and its classification carries provenance "rule".
+#   2. A document no rule matches is left `unclassified` for the agent. An agent verdict recorded
+#      with `filingcabinet classify` carries provenance "agent" and outranks any rule match.
+#   3. `classify` prints a paste-ready [[rules]] stanza so you can promote a good agent verdict
+#      into a rule. FilingCabinet never edits this file itself.
+#
+# Term matching is case-insensitive over the document's whitespace-collapsed text. A rule with no
+# `all`, `any`, or `regex` matches nothing on purpose: a catch-all would silently claim every
+# document, which is the kind of guess this tool refuses to make.
+
+version = 1
+
+# Controlled vocabulary. A rule naming a doc_type outside this list is a config error.
+doc_types = ["invoice", "statement", "receipt", "letter", "policy"]
+
+# How to read an ambiguous numeric date such as 03/02/2026. "dmy" (default) or "mdy".
+# A date whose first field is greater than 12 resolves itself and ignores this.
+date_order = "dmy"
+
+# Parties are vendors, people, or institutions. `display` is what lands in the filename;
+# `aliases` widen the `any` terms of every rule that names this party.
+[parties.northwind]
+display = "Northwind Supplies"
+aliases = ["northwind supplies", "northwind ltd"]
+
+[parties.acme-mutual]
+display = "Acme Mutual"
+aliases = ["acme mutual insurance", "acme mutual plc"]
+
+# id       - unique, and the tie-break when two rules share a priority
+# party    - a key from [parties]
+# doc_type - a value from doc_types
+# all/any/none - plain terms; `all` must all appear, one of `any` must appear, `none` must not
+# regex    - optional, case-insensitive, searched (not anchored); keep it small
+# folder   - relative to [paths].root; absolute or ".."-bearing folders are rejected
+# priority - higher wins
+[[rules]]
+id = "northwind-invoice"
+party = "northwind"
+doc_type = "invoice"
+all = ["northwind"]
+any = ["invoice", "tax invoice"]
+none = ["statement"]
+regex = "invoice\\s+no"
+folder = "Suppliers/Northwind"
+tags = ["supplier"]
+priority = 100
+
+[[rules]]
+id = "northwind-statement"
+party = "northwind"
+doc_type = "statement"
+all = ["northwind"]
+any = ["statement of account", "monthly statement"]
+folder = "Suppliers/Northwind"
+tags = ["supplier"]
+priority = 90
+
+[[rules]]
+id = "acme-mutual-policy"
+party = "acme-mutual"
+doc_type = "policy"
+any = ["policy schedule", "certificate of insurance"]
+folder = "Insurance/Acme Mutual"
+tags = ["insurance"]
+priority = 80

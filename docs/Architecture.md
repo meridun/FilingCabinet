@@ -25,8 +25,9 @@ without depending on paths or on this schema.
   `apply`.
 - `schema_migrations` — forward-only numbered `.sql` files in `migrations/`.
 
-Later phases add: page-level hashes (dedup), FTS5 over `ocr_text` (search), a rules table or
-config-loaded rule set (classification), a review-queue table (uncertain dupes and proposals).
+Later phases add: page-level hashes (dedup), FTS5 over `ocr_text` (search), a `classification`
+table for agent verdicts (rule matches are recomputed from the taxonomy config, never stored —
+§6), a review-queue table (uncertain dupes and proposals).
 
 ## 3. Ingest (phase 2)
 
@@ -104,18 +105,79 @@ pages currently deferred for an environment reason — alongside the status coun
 
 ## 6. Organize (phases 5-6)
 
-**Rules first, agent for the remainder.** A taxonomy config (doc types, party aliases,
-regex/keyword rules) classifies known vendors deterministically. Unknowns go to the agent, whose
-verdicts carry provenance (`agent`) and can be promoted into rules.
+**Rules first, agent for the remainder.** An instance-side `taxonomy.toml` (never committed to
+this repo — §9) holds doc types, parties (`display` name plus `aliases`), and rules. A rule names
+an `id`, optional `party` / `doc_type` / `folder` / `tags`, and match terms (`all` — every term
+must appear; `any` — at least one must appear, when non-empty; `none` — none may appear;
+`regex` — optional, searched case-insensitively). Rules are tried in `(priority descending, id
+ascending)` order — a total order, so a plan is reproducible — and the first match wins. A rule
+with none of `all` / `any` / `regex` matches nothing on purpose: a catch-all would silently claim
+every document. A document no rule matches is `unclassified` and waits for an agent verdict,
+submitted through `filingcabinet classify` and persisted in the `classification` table
+(migration `006_organize.sql`, one row per document, `provenance='agent'`). **Rule matches are
+never persisted** — they are a pure function of `taxonomy.toml` recomputed on every `propose`, so
+an edited rule takes effect immediately without a stale stored copy; a stored agent verdict
+outranks a competing rule. `classify` also prints a paste-ready `[[rules]]` stanza so a good
+verdict can be promoted into a rule — the tool never edits `taxonomy.toml` itself, the same
+never-act-unasked posture as document moves.
 
-`propose` writes a **plan**: per document, the target name from `[naming].template` (default
-`{doc_date}_{party}_{doc_type}_{detail}`), any folder move, tags, and the rule or agent that
-decided. A plan is a file a human reviews. `apply <plan>` executes it, writes `move_log`, and
+`propose` writes a **plan file** (JSON, one per run, named `plan-<timestamp>-<hex>.json`) to
+`[paths].plan_dir`, which must resolve outside `[paths].root` — a plan is a proposal, not a
+document, and `propose` refuses to start if the configured or `--out` path would land inside the
+root. The plan is `{plan_version, plan_id, created_at, root, taxonomy, template, summary,
+entries[]}`. Each entry carries, per document: `current_path`, `target_path`, `folder`,
+`target_name`, `fields` (the raw classification values — `party`, `doc_type`, `detail`,
+`doc_date`), `tags`, `provenance` (`rule` or `agent`), `rule_id`, and `status` — `move` (rename
+and/or folder change), `noop` (target equals current path), `unclassified`, `collision` (two
+documents render the same target, or the target already exists and isn't this document's own
+path — never auto-suffixed; a human resolves it), or `error` (e.g. a folder that would resolve
+outside the root).
+
+> **Security-critical: `target_path` vs. `fields`.** `entries[].target_path` is the only
+> sanitized, root-verified value in a plan file, and the only one `apply` (phase 6) may act on.
+> `entries[].fields` holds the raw, pre-sanitization classification values for display and
+> debugging — `party`/`detail`/`doc_date` come from OCR text (attacker-influenceable content
+> inside a scanned document) and can contain path separators, `..`, or other characters that are
+> stripped from a filename. `apply` must never re-render a name from `fields`, and must re-run
+> the containment check on `target_path` (`resolved.is_relative_to(root.resolve())`) immediately
+> before touching the filesystem — `propose`'s own containment check is time-of-check, and
+> `apply` runs later, against a filesystem that may have changed underneath it.
+
+Rendering a target name is layered defense, because phase 6 executes these paths: (1) a
+`folder` that is absolute, drive-qualified, or contains `..` is rejected at taxonomy-load time
+(and identically for an agent-supplied `--folder`); (2) `sanitize_component` NFKC-normalizes
+each rendered field, replaces every path separator and anything outside `[A-Za-z0-9._-]` with
+`_`, strips leading/trailing separators, and guards Windows-reserved device names
+(`CON`, `PRN`, `NUL`, `COM1-9`, `LPT1-9`); (3) the final target is resolved against the root and
+must be `is_relative_to` it, or the entry becomes `status='error'` instead of a move. The
+template (`[naming].template`, default `{doc_date}_{party}_{doc_type}_{detail}`) is tokenized,
+never passed to `str.format`, so a document whose OCR text literally contains `{party}` cannot
+influence rendering; an unresolved field drops together with its preceding separator (no
+`detail` renders `2026-02-03_Northwind_invoice`, not a trailing underscore).
+
+`propose` is **read-only on both the document tree and the index**: it opens nothing under
+`[paths].root` for writing (the plan file is the only output, and it is forced outside the root)
+and writes nothing to `document` — `doc_date`/`party`/`doc_type`/`detail` stay `NULL` until
+`apply` commits an approved plan. The only index write in this phase is the explicit `classify`
+verdict.
+
+`apply <plan>` (phase 6) executes an approved plan against `target_path`, writes `move_log`, and
 checks mtime stability and file locks first so it never fights the sync client mid-write.
 `undo <plan_id>` reverses from the log.
 
-The date in a filename is the date the document pertains to, from OCR or rules. Scan date
-stays in the index.
+The date in a filename is the date the document pertains to, extracted from OCR text (ISO,
+`D Month YYYY`, `Month D, YYYY`, or numeric — `[taxonomy].date_order`, default `dmy`, breaks a
+numeric ambiguity; an invalid calendar date such as `31/02/2026` yields no date rather than a
+guess). Scan date stays in the index.
+
+**Config-relative path resolution.** A relative value under `[paths]` in `config.toml` (`root`,
+`data_dir`, `snapshot_dir`, `taxonomy`, `plan_dir`) resolves against **the config file's own
+directory**, not the process's working directory — so a scheduled task or an agent invoked from
+an unrelated `cwd` still finds the right instance. `--flags` and `FC_*` environment variables are
+shell inputs and keep their working-directory-relative meaning; an absolute `[paths]` value
+passes through unchanged either way. `propose`'s text and `--json` output report the taxonomy
+path it resolved and its rule count (or `missing, 0 rules`), so an all-unclassified run is never
+a silent miss of the wrong file.
 
 **Tools never move or rename files unasked.** This is the invariant every change is measured
 against.

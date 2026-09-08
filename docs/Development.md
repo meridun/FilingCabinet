@@ -13,7 +13,14 @@ filingcabinet status
 ```
 
 `fc` is an alias for `filingcabinet`. Every verb accepts `--json`, `--db`, and `--config`;
-`FC_DB` and `FC_CONFIG` environment variables override `config.toml`.
+`FC_DB` and `FC_CONFIG` environment variables override `config.toml`. Verbs: `migrate`,
+`status`, `ingest`, `dupes`, `ocr run`, `ocr submit`, `find`, `doctor`, `propose`, `classify`,
+`snapshot`, `restore` (`docs/Architecture.md` §5-6, §8).
+
+A relative `[paths]` value in `config.toml` (`root`, `data_dir`, `snapshot_dir`, `taxonomy`,
+`plan_dir`) resolves against **the config file's directory**, not the shell's working directory;
+`--flags` and `FC_*` environment variables stay working-directory-relative
+(`docs/Architecture.md` §6).
 
 ## System dependencies (phase 4 onward)
 

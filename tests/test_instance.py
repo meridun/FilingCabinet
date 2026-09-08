@@ -9,7 +9,7 @@ import pytest
 from filingcabinet import __version__, cli, instance
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCAFFOLD = {"README.md", ".gitignore", "CLAUDE.md", "config.toml"}
+SCAFFOLD = {"README.md", ".gitignore", "CLAUDE.md", "config.toml", "taxonomy.toml"}
 
 
 def _init(tmp_path, capsys, *extra):
@@ -17,7 +17,7 @@ def _init(tmp_path, capsys, *extra):
     return json.loads(capsys.readouterr().out)
 
 
-def test_init_creates_all_four_files(tmp_path, capsys):
+def test_init_creates_the_whole_scaffold(tmp_path, capsys):
     target = tmp_path / "fc-data"
     out = _init(target, capsys)
     assert set(out["created"]) == SCAFFOLD
@@ -93,3 +93,16 @@ def test_docs_instance_page_exists_and_mentions_scheduling():
     assert "ingest" in page
     assert "Task Scheduler" in page or "cron" in page
     assert "instance init" in page
+
+
+def test_scaffolded_taxonomy_is_verbatim_and_loadable(tmp_path):
+    """The example carries regex escapes and must not be str.format-ed on the way out."""
+    from filingcabinet import taxonomy as taxonomy_mod
+
+    instance.init_instance(tmp_path)
+    scaffolded = tmp_path / "taxonomy.toml"
+    assert scaffolded.read_text(encoding="utf-8") == instance.read_template(
+        "taxonomy.example.toml"
+    )
+    tax = taxonomy_mod.load_taxonomy(scaffolded)
+    assert {r.rule_id for r in tax.rules} >= {"northwind-invoice"}

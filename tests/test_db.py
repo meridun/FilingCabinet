@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from filingcabinet import db
@@ -117,3 +119,47 @@ def test_005_backfills_documents_written_before_the_migration(tmp_path):
     document_id = _insert_document(conn, "sha-old", "predates the index")
     db.migrate(conn)  # apply 005 on top of an already-populated database
     assert _fts_matches(conn, "predates") == [document_id]
+
+
+def test_006_adds_classification_table():
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(classification)")}
+    assert {
+        "document_id",
+        "party",
+        "doc_type",
+        "detail",
+        "doc_date",
+        "tags",
+        "folder",
+        "provenance",
+        "note",
+        "created_at",
+        "updated_at",
+    } <= cols
+
+
+def test_006_classification_is_one_row_per_document():
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    document_id = _insert_document(conn, "sha-c", "text")
+    conn.execute(
+        "INSERT INTO classification (document_id, provenance, created_at, updated_at) "
+        "VALUES (?, 'agent', 'now', 'now')",
+        (document_id,),
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO classification (document_id, provenance, created_at, updated_at) "
+            "VALUES (?, 'agent', 'now', 'now')",
+            (document_id,),
+        )
+
+
+def test_migrate_is_still_a_no_op_on_a_fully_migrated_database(tmp_path):
+    """006 is additive: re-running `migrate` applies nothing and disturbs nothing."""
+    conn = db.connect(tmp_path / "fc.db")
+    applied = db.migrate(conn)
+    assert "006_organize.sql" in applied
+    assert db.migrate(conn) == []
