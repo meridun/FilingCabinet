@@ -158,6 +158,28 @@ def test_validate_accepts_a_real_snapshot(tmp_path):
     assert report["integrity"] == "ok" and "001_init.sql" in report["applied"]
 
 
+def test_round_trip_through_a_spaced_non_ascii_directory(tmp_path):
+    """The whole cycle survives a real-world snapshot path.
+
+    ``snapshot_dir`` is meant to be a cloud-synced folder, which on Windows routinely
+    means something like ``OneDrive - Acme Ltd/FilingCabinet Snapshots``. Validation
+    reaches SQLite as a hand-built ``file:`` URI (``_read_only_uri``), so spaces and
+    non-ASCII characters are a quoting seam a plain temp path never exercises.
+    """
+    dbp = _migrated_db(tmp_path / "My Data (café)" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    snapshot_dir = tmp_path / "OneDrive - Ácme Ltd" / "FilingCabinet Snapshots"
+
+    target = snapshot.create_snapshot(dbp, snapshot_dir, now=NOW)
+    assert target.parent == snapshot_dir and target.is_file()
+    assert snapshot.validate_snapshot(target)["integrity"] == "ok"
+    assert snapshot.list_snapshots(snapshot_dir) == [target]
+
+    result = snapshot.restore_snapshot(dbp, target, now=NOW)
+    assert result["row_counts"]["document"] == 1
+    assert Path(result["rescue_copy"]).is_file()
+
+
 def test_restore_banks_rescue_copy_and_clears_sidecars(tmp_path):
     dbp = _migrated_db(tmp_path / "data" / "fc.db")
     _insert_document(dbp, "a" * 64)
@@ -233,6 +255,7 @@ def test_rescue_copy_keeps_committed_rows_still_in_the_wal(tmp_path):
     finally:
         conn.close()
     assert kept == 1, "rescue copy lost a committed row that lived only in the -wal"
+
 
 def test_restore_refuses_while_another_reader_holds_the_index(tmp_path):
     """A held index cannot be banked faithfully, so restore stops before touching anything.
