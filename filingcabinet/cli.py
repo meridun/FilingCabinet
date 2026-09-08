@@ -1,4 +1,6 @@
-"""`filingcabinet` (alias `fc`) command-line entry point. Verbs: migrate, status, ingest, instance.
+"""`filingcabinet` (alias `fc`) command-line entry point.
+
+Verbs: migrate, status, ingest, dupes, instance.
 
 DB path resolution: --db flag > FC_DB env var > config.toml [paths].data_dir + /filingcabinet.db.
 Config path resolution: --config flag > FC_CONFIG env var > ./config.toml.
@@ -14,7 +16,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-from . import __version__, db, ingest as ingest_mod, instance as instance_mod
+from . import __version__, db, dedup as dedup_mod, ingest as ingest_mod, instance as instance_mod
 
 DB_FILENAME = "filingcabinet.db"
 
@@ -134,6 +136,96 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _require_database(args: argparse.Namespace) -> Path:
+    db_path = resolve_db_path(args)
+    if not db.database_exists(db_path):
+        raise SystemExit(f"error: no database at {db_path} - run `filingcabinet migrate --create`")
+    return db_path
+
+
+def _resolve_max_distance(args: argparse.Namespace) -> int:
+    """Threshold precedence: --max-distance > [dedup].phash_max_distance > built-in default."""
+    if args.max_distance is not None:
+        return int(args.max_distance)
+    configured = load_config(args.config).get("dedup", {}).get("phash_max_distance")
+    if configured is None:
+        return dedup_mod.DEFAULT_PHASH_MAX_DISTANCE
+    try:  # a bad config value is a CLI error, not a traceback
+        return int(configured)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"error: [dedup].phash_max_distance must be an integer, got {configured!r}"
+        ) from None
+
+
+def cmd_dupes_report(args: argparse.Namespace) -> int:
+    db_path = _require_database(args)
+    root = resolve_root(args)
+    max_distance = _resolve_max_distance(args)
+    conn = db.connect(db_path)
+    try:
+        summary = dedup_mod.run_report(conn, root, max_distance=max_distance)
+    finally:
+        conn.close()
+    payload = {
+        "db": str(db_path),
+        "root": str(root),
+        "max_distance": max_distance,
+        **summary.as_dict(),
+    }
+    _emit(
+        args,
+        payload,
+        f"{root}: {summary.exact_groups} exact group(s), {summary.near} near, "
+        f"{summary.subset} subset, {summary.queued} queued",
+    )
+    return 0
+
+
+def cmd_dupes_label(args: argparse.Namespace) -> int:
+    db_path = _require_database(args)
+    conn = db.connect(db_path)
+    try:
+        db.require_migrated(conn)
+        if args.export:
+            labels = dedup_mod.export_labels(conn)
+            payload = {"db": str(db_path), "labels": labels}
+            text = "\n".join(
+                f"{row['document_a']} {row['document_b']} {row['kind']}: {row['verdict']}"
+                for row in labels
+            ) or "no labels recorded"
+        elif args.pair:
+            if not args.kind or not args.verdict:
+                raise SystemExit("error: --pair requires --kind and --verdict")
+            document_a, document_b = args.pair
+            try:
+                verdict = dedup_mod.record_label(
+                    conn, document_a, document_b, args.kind, args.verdict
+                )
+            except ValueError as exc:
+                raise SystemExit(f"error: {exc}") from exc
+            payload = {
+                "db": str(db_path),
+                "document_a": document_a,
+                "document_b": document_b,
+                "kind": args.kind,
+                "verdict": verdict,
+            }
+            text = f"labelled {document_a} {document_b} ({args.kind}): {verdict}"
+        else:  # --list
+            pending = [dict(row) for row in dedup_mod.pending_reviews(conn, limit=args.limit)]
+            payload = {"db": str(db_path), "pending": pending}
+            text = "\n".join(
+                f"#{row['review_id']} {row['kind']} {row['document_a']} {row['document_b']}: "
+                f"{row['detail']}"
+                for row in pending
+            ) or "review queue empty"
+    finally:
+        conn.close()
+    _emit(args, payload, text)
+    return 0
+
+
 def cmd_instance_init(args: argparse.Namespace) -> int:
     try:
         result = instance_mod.init_instance(Path(args.dir), force=args.force)
@@ -168,6 +260,28 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ingest", help="scan the document root and index new or changed files")
     p.add_argument("--root", help="document root (overrides FC_ROOT and config)")
     p.set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser("dupes", help="duplicate detection: report tiers, label the sample")
+    dupes_sub = p.add_subparsers(dest="dupes_command", required=True)
+    q = dupes_sub.add_parser("report", help="exact, near-duplicate, and subset tiers")
+    q.add_argument("--root", help="document root (overrides FC_ROOT and config)")
+    q.add_argument(
+        "--max-distance",
+        type=int,
+        help="perceptual-hash Hamming threshold (overrides [dedup].phash_max_distance)",
+    )
+    q.set_defaults(func=cmd_dupes_report)
+    q = dupes_sub.add_parser("label", help="build the labelled sample used to tune thresholds")
+    group = q.add_mutually_exclusive_group(required=True)
+    group.add_argument("--list", action="store_true", help="pending review-queue pairs")
+    group.add_argument(
+        "--pair", nargs=2, type=int, metavar=("A", "B"), help="record a verdict for one pair"
+    )
+    group.add_argument("--export", action="store_true", help="the labelled sample as records")
+    q.add_argument("--kind", choices=dedup_mod.VALID_KINDS, help="tier the pair came from")
+    q.add_argument("--verdict", choices=["dup", "not-dup", "not_dup"], help="the human judgment")
+    q.add_argument("--limit", type=int, help="cap the number of pending pairs listed")
+    q.set_defaults(func=cmd_dupes_label)
 
     p = sub.add_parser("instance", help="manage the private instance repo")
     instance_sub = p.add_subparsers(dest="instance_command", required=True)
