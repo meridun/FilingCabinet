@@ -1,6 +1,10 @@
 # FilingCabinet configuration - copy to config.toml (gitignored) and edit for your machine.
 #
 # Path policy (docs/Architecture.md):
+#   * relative paths in [paths] resolve against THIS FILE'S directory, not the shell's working
+#              directory, so an instance works from anywhere. Command-line flags (--root,
+#              --taxonomy, --plan-dir) and FC_* environment variables are shell inputs and stay
+#              relative to the working directory.
 #   * root     is the Drive-synced document folder. Bytes live here; Google Drive replicates.
 #              FilingCabinet reads it and, only on an approved `apply`, renames/moves within it.
 #   * inbox    is a folder (usually under root) where the scanner/phone drops new files.
@@ -13,9 +17,12 @@ root = 'C:\Users\you\My Drive\Documents'
 inbox = 'C:\Users\you\My Drive\Documents\_inbox'
 data_dir = 'C:\filingcabinet-data'
 snapshot_dir = 'C:\Users\you\My Drive\filingcabinet\snapshots'
-# taxonomy is the deterministic rules file (see taxonomy.toml); it defaults to taxonomy.toml
-# beside this config. plan_dir holds `propose` plan files and must be OUTSIDE root: plans are
-# proposals, never applied automatically, and a plan file is not a document.
+# taxonomy is the deterministic rules file (see taxonomy.toml); a relative value - and the
+# default when the key is absent - is taxonomy.toml beside this config, so `propose` finds it
+# from any working directory. `propose` prints the file it read and its rule count, so an
+# all-unclassified run is never a silent miss. plan_dir holds `propose` plan files and must be
+# OUTSIDE root: plans are proposals, never applied automatically, and a plan file is not a
+# document.
 taxonomy = 'taxonomy.toml'
 plan_dir = 'C:\filingcabinet-data\plans'
 

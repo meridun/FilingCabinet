@@ -5,6 +5,8 @@ restore, instance.
 
 DB path resolution: --db flag > FC_DB env var > config.toml [paths].data_dir + /filingcabinet.db.
 Config path resolution: --config flag > FC_CONFIG env var > ./config.toml.
+A relative path inside `[paths]` resolves against the directory holding that config file; flags
+and environment variables are shell inputs and stay relative to the working directory.
 Every verb supports --json so agents (and the phase-7 MCP wrapper) get structured output.
 """
 
@@ -35,8 +37,26 @@ TAXONOMY_FILENAME = "taxonomy.toml"
 DEFAULT_PLAN_DIRNAME = "plans"
 
 
+def config_file_path(config_arg: str | None) -> Path:
+    """Config path resolution: --config flag > FC_CONFIG env var > ./config.toml."""
+    return Path(config_arg or os.environ.get("FC_CONFIG") or "config.toml")
+
+
+def config_relative(value: str, config_arg: str | None) -> Path:
+    """Resolve a `[paths]` value against the config file's directory, not the working directory.
+
+    A config file is read from a fixed place, so a relative value inside it means "beside this
+    file" - which is what config.example.toml already promises. Flags and environment variables
+    are shell inputs and keep their working-directory-relative meaning.
+    """
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (config_file_path(config_arg).parent / path).resolve()
+
+
 def load_config(config_arg: str | None) -> dict:
-    config_path = Path(config_arg or os.environ.get("FC_CONFIG") or "config.toml")
+    config_path = config_file_path(config_arg)
     if config_path.is_file():
         with config_path.open("rb") as fh:
             return tomllib.load(fh)
@@ -52,7 +72,7 @@ def resolve_db_path(args: argparse.Namespace) -> Path:
     config = load_config(args.config)
     data_dir = config.get("paths", {}).get("data_dir")
     if data_dir:
-        return Path(data_dir) / DB_FILENAME
+        return config_relative(data_dir, args.config) / DB_FILENAME
     raise SystemExit(
         "error: no database path - pass --db, set FC_DB, or set [paths].data_dir in "
         "config.toml (see config.example.toml)"
@@ -60,69 +80,81 @@ def resolve_db_path(args: argparse.Namespace) -> Path:
 
 
 def resolve_root(args: argparse.Namespace) -> Path:
-    """Document root resolution: --root flag > FC_ROOT env var > config.toml [paths].root."""
-    root = getattr(args, "root", None) or os.environ.get("FC_ROOT")
-    if not root:
-        config = load_config(args.config)
-        root = config.get("paths", {}).get("root")
-    if not root:
+    """Document root resolution: --root flag > FC_ROOT env var > config.toml [paths].root.
+
+    A relative `[paths].root` resolves against the config file's directory (`config_relative`).
+    """
+    supplied = getattr(args, "root", None) or os.environ.get("FC_ROOT")
+    path = Path(supplied) if supplied else None
+    if path is None:
+        configured = load_config(args.config).get("paths", {}).get("root")
+        if configured:
+            path = config_relative(configured, args.config)
+    if path is None:
         raise SystemExit(
             "error: no document root - pass --root, set FC_ROOT, or set [paths].root in "
             "config.toml (see config.example.toml)"
         )
-    path = Path(root)
     if not path.is_dir():
         raise SystemExit(f"error: document root {path} is not a directory")
     return path
 
 
 def resolve_snapshot_dir(args: argparse.Namespace) -> Path:
-    """Snapshot dir: --snapshot-dir flag > FC_SNAPSHOT_DIR env > config [paths].snapshot_dir."""
-    snapshot_dir = getattr(args, "snapshot_dir", None) or os.environ.get("FC_SNAPSHOT_DIR")
-    if not snapshot_dir:
-        config = load_config(args.config)
-        snapshot_dir = config.get("paths", {}).get("snapshot_dir")
-    if not snapshot_dir:
+    """Snapshot dir: --snapshot-dir flag > FC_SNAPSHOT_DIR env > config [paths].snapshot_dir.
+
+    A relative `[paths].snapshot_dir` resolves against the config file's directory.
+    """
+    supplied = getattr(args, "snapshot_dir", None) or os.environ.get("FC_SNAPSHOT_DIR")
+    if supplied:
+        return Path(supplied)
+    configured = load_config(args.config).get("paths", {}).get("snapshot_dir")
+    if not configured:
         raise SystemExit(
             "error: no snapshot directory - pass --snapshot-dir, set FC_SNAPSHOT_DIR, or set "
             "[paths].snapshot_dir in config.toml (see config.example.toml)"
         )
-    return Path(snapshot_dir)
+    return config_relative(configured, args.config)
 
 
 def resolve_taxonomy_path(args: argparse.Namespace) -> Path:
     """Taxonomy: --taxonomy > FC_TAXONOMY > config [paths].taxonomy > taxonomy.toml beside it.
 
+    Always absolute, so `propose` can report exactly which file it read. A relative
+    `[paths].taxonomy` resolves against the config file's directory, so the scaffolded
+    `taxonomy = 'taxonomy.toml'` finds the instance's own rules from any working directory;
+    --taxonomy and FC_TAXONOMY stay working-directory-relative.
+
     A missing file is not an error - `filingcabinet.taxonomy.load_taxonomy` reads it as an empty
-    taxonomy, so every document routes to the agent instead of the run failing.
+    taxonomy, so every document routes to the agent instead of the run failing - but `propose`
+    reports the path and the rule count, so an all-unclassified run is never silent.
     """
-    taxonomy_path = getattr(args, "taxonomy", None) or os.environ.get("FC_TAXONOMY")
-    if taxonomy_path:
-        return Path(taxonomy_path)
+    supplied = getattr(args, "taxonomy", None) or os.environ.get("FC_TAXONOMY")
+    if supplied:
+        return Path(supplied).resolve()
     configured = load_config(args.config).get("paths", {}).get("taxonomy")
-    if configured:
-        return Path(configured)
-    config_path = Path(args.config or os.environ.get("FC_CONFIG") or "config.toml")
-    return config_path.parent / TAXONOMY_FILENAME
+    return config_relative(configured or TAXONOMY_FILENAME, args.config)
 
 
 def resolve_plan_dir(args: argparse.Namespace, root: Path) -> Path:
     """Plan dir: --out's parent > --plan-dir > FC_PLAN_DIR > config [paths].plan_dir > data_dir.
 
     Never under ``[paths].root``: a plan file is not a document, and writing one into the tree
-    would be an unasked write to the corpus (docs/Architecture.md section 6).
+    would be an unasked write to the corpus (docs/Architecture.md section 6). A relative
+    `[paths].plan_dir` resolves against the config file's directory.
     """
     out = getattr(args, "out", None)
+    supplied = getattr(args, "plan_dir", None) or os.environ.get("FC_PLAN_DIR")
     if out:
         plan_dir = Path(out).parent
+    elif supplied:
+        plan_dir = Path(supplied)
     else:
-        configured = (
-            getattr(args, "plan_dir", None)
-            or os.environ.get("FC_PLAN_DIR")
-            or load_config(args.config).get("paths", {}).get("plan_dir")
-        )
+        configured = load_config(args.config).get("paths", {}).get("plan_dir")
         plan_dir = (
-            Path(configured) if configured else resolve_db_path(args).parent / DEFAULT_PLAN_DIRNAME
+            config_relative(configured, args.config)
+            if configured
+            else resolve_db_path(args).parent / DEFAULT_PLAN_DIRNAME
         )
     resolved_root = root.resolve()
     probe = plan_dir if plan_dir.is_absolute() else Path.cwd() / plan_dir
@@ -460,6 +492,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
     root = resolve_root(args)
     taxonomy_path = resolve_taxonomy_path(args)
     template = _resolve_naming_template(args)
+    taxonomy_exists = taxonomy_path.is_file()
     taxonomy = taxonomy_mod.load_taxonomy(taxonomy_path)
 
     plan_dir = resolve_plan_dir(args, root)  # guards --out and --plan-dir alike, before any work
@@ -497,6 +530,8 @@ def cmd_propose(args: argparse.Namespace) -> int:
         "db": str(db_path),
         "root": str(root),
         "taxonomy": str(taxonomy_path),
+        "taxonomy_exists": taxonomy_exists,
+        "taxonomy_rules": len(taxonomy.rules),
         "template": template,
         "plan_id": plan_id,
         "plan": str(plan_path) if plan_path else None,
@@ -504,6 +539,11 @@ def cmd_propose(args: argparse.Namespace) -> int:
         **summary.as_dict(),
         "entries": [entry.as_dict() for entry in entries],
     }
+    # Say which rules file was read and whether it was there: an all-unclassified run caused by a
+    # taxonomy that is simply absent must be explainable from the output alone (issue #18).
+    taxonomy_note = (
+        f"{len(taxonomy.rules)} rule(s)" if taxonomy_exists else "missing, 0 rules"
+    )
     _emit(
         args,
         payload,
@@ -511,6 +551,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
         f"{summary.unclassified} unclassified, {summary.collision} collision, "
         f"{summary.errors} error(s); {summary.rule_matched} by rule, "
         f"{summary.agent_matched} by agent\n"
+        f"taxonomy: {taxonomy_path} ({taxonomy_note})\n"
         f"plan: {plan_path if plan_path else 'not written (--dry-run)'}",
     )
     return 0

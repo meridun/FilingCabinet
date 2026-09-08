@@ -1,3 +1,4 @@
+import argparse
 import json
 from pathlib import Path
 
@@ -553,7 +554,8 @@ def test_propose_json_shape_and_plan_file(tmp_path, monkeypatch, capsys):
         "--taxonomy", str(tax), "--plan-dir", str(plan_dir),
     ]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert {"db", "root", "taxonomy", "template", "plan_id", "plan", "dry_run", "documents",
+    assert {"db", "root", "taxonomy", "taxonomy_exists", "taxonomy_rules", "template",
+            "plan_id", "plan", "dry_run", "documents",
             "move", "noop", "unclassified", "collision", "errors", "rule_matched",
             "agent_matched", "entries"} <= set(out)
     entry = out["entries"][0]
@@ -656,6 +658,87 @@ def test_taxonomy_path_precedence(tmp_path, monkeypatch, capsys):
     assert taxonomy_used() == str(env_tax)  # env beats config
     monkeypatch.delenv("FC_TAXONOMY")
     assert taxonomy_used() == str(cfg_tax)  # config last
+
+
+def test_config_relative_paths_resolve_beside_the_config_file(tmp_path, monkeypatch):
+    """Relative [paths] values mean "beside config.toml", not "beside the shell's cwd" (#18)."""
+    for name in ("FC_ROOT", "FC_DB", "FC_TAXONOMY", "FC_PLAN_DIR", "FC_CONFIG",
+                 "FC_SNAPSHOT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    instance = tmp_path / "instance"
+    (instance / "docs").mkdir(parents=True)
+    (instance / "data").mkdir()
+    (instance / "taxonomy.toml").write_text(TAXONOMY_TOML, encoding="utf-8")
+    cfg = instance / "config.toml"
+    cfg.write_text(
+        "[paths]\nroot = 'docs'\ndata_dir = 'data'\nsnapshot_dir = 'snapshots'\n"
+        "taxonomy = 'taxonomy.toml'\nplan_dir = 'plans'\n",
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)  # the failure this covers only shows up away from the config
+    args = argparse.Namespace(config=str(cfg), db=None, root=None, snapshot_dir=None,
+                              taxonomy=None, plan_dir=None, out=None)
+
+    assert cli.resolve_taxonomy_path(args) == (instance / "taxonomy.toml").resolve()
+    assert cli.resolve_db_path(args) == (instance / "data").resolve() / cli.DB_FILENAME
+    assert cli.resolve_root(args) == (instance / "docs").resolve()
+    assert cli.resolve_snapshot_dir(args) == (instance / "snapshots").resolve()
+    assert cli.resolve_plan_dir(args, instance / "docs") == (instance / "plans").resolve()
+
+    # An absent [paths].taxonomy still defaults to taxonomy.toml beside the config file.
+    cfg.write_text("[paths]\nroot = 'docs'\n", encoding="utf-8")
+    assert cli.resolve_taxonomy_path(args) == (instance / "taxonomy.toml").resolve()
+
+    # A flag is a shell input: it stays relative to the working directory, made absolute.
+    (elsewhere / "local.toml").write_text(TAXONOMY_TOML, encoding="utf-8")
+    args.taxonomy = "local.toml"
+    assert cli.resolve_taxonomy_path(args) == (elsewhere / "local.toml").resolve()
+
+
+def test_propose_from_another_cwd_loads_the_config_relative_taxonomy(
+    tmp_path, monkeypatch, capsys
+):
+    """The scaffolded `taxonomy = 'taxonomy.toml'` must classify from any cwd (#18)."""
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        f"[paths]\nroot = '{root.name}'\ntaxonomy = 'taxonomy.toml'\nplan_dir = 'plans'\n",
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "--config", str(cfg), "--json", "propose", "--dry-run"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["taxonomy"] == str(tax.resolve())
+    assert out["taxonomy_exists"] is True and out["taxonomy_rules"] == 1
+    assert out["rule_matched"] == 1 and out["unclassified"] == 0
+    assert not (elsewhere / "taxonomy.toml").exists()  # nothing was created in the cwd
+
+
+def test_propose_reports_the_taxonomy_it_loaded(tmp_path, monkeypatch, capsys):
+    """An all-unclassified run caused by a missing rules file must be explainable (#18)."""
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    absent = tmp_path / "absent.toml"
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "propose", "--root", str(root), "--taxonomy", str(absent),
+                     "--plan-dir", str(tmp_path / "plans")]) == 0
+    assert f"taxonomy: {absent.resolve()} (missing, 0 rules)" in capsys.readouterr().out
+
+    assert cli.main(["--db", dbp, "propose", "--root", str(root), "--taxonomy", str(tax),
+                     "--plan-dir", str(tmp_path / "plans")]) == 0
+    assert f"taxonomy: {tax.resolve()} (1 rule(s))" in capsys.readouterr().out
+
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "--json", "propose", "--root", str(root), "--taxonomy",
+                     str(absent), "--dry-run", "--plan-dir", str(tmp_path / "plans")]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["taxonomy"] == str(absent.resolve())
+    assert out["taxonomy_exists"] is False and out["taxonomy_rules"] == 0
+    assert out["unclassified"] == 1
 
 
 def test_malformed_taxonomy_exits_two_without_a_traceback(tmp_path, monkeypatch, capsys):
