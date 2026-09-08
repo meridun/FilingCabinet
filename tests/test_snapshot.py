@@ -1,0 +1,489 @@
+import sqlite3
+import subprocess
+import sys
+import textwrap
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from filingcabinet import db, snapshot
+
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _migrated_db(path: Path) -> Path:
+    conn = db.connect(path)
+    db.migrate(conn)
+    conn.close()
+    return path
+
+
+def _insert_document(path: Path, sha: str) -> None:
+    stamp = NOW.isoformat(timespec="seconds")
+    conn = db.connect(path)
+    with conn:
+        conn.execute(
+            "INSERT INTO document (sha256, size_bytes, first_seen_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (sha, len(sha), stamp, stamp),
+        )
+    conn.close()
+
+
+def _touch_snapshots(snapshot_dir: Path, stamps: list[datetime]) -> list[Path]:
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    made = []
+    for stamp in stamps:
+        p = snapshot_dir / snapshot.snapshot_name(stamp)
+        p.write_bytes(b"placeholder")
+        made.append(p)
+    return made
+
+
+def test_create_snapshot_makes_consistent_copy(tmp_path):
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    before = dbp.read_bytes()
+
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+
+    assert target.name == "filingcabinet-20260601T120000Z.db"
+    assert target.parent == tmp_path / "snaps"
+    conn = db.connect(target)
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 1
+    conn.close()
+    assert dbp.read_bytes() == before  # the live index is untouched
+
+
+def test_create_snapshot_requires_migrated(tmp_path):
+    dbp = tmp_path / "fc.db"
+    conn = db.connect(dbp)  # creates the file without applying migrations
+    conn.execute("CREATE TABLE unrelated (x INTEGER)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(db.NotMigratedError):
+        snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+
+
+def test_create_snapshot_refuses_missing_database(tmp_path):
+    with pytest.raises(snapshot.SnapshotError):
+        snapshot.create_snapshot(tmp_path / "nope.db", tmp_path / "snaps", now=NOW)
+
+
+def test_create_snapshot_refuses_existing_target(tmp_path):
+    dbp = _migrated_db(tmp_path / "fc.db")
+    snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    with pytest.raises(snapshot.SnapshotError):
+        snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+
+
+def test_rotate_keeps_daily_window_and_weeklies(tmp_path):
+    snaps = tmp_path / "snaps"
+    stamps = [NOW - timedelta(days=n) for n in range(0, 180, 3)]
+    _touch_snapshots(snaps, stamps)
+
+    deleted = snapshot.rotate(snaps, now=NOW)
+    kept = {p.name for p in snapshot.list_snapshots(snaps)}
+
+    assert kept.isdisjoint({p.name for p in deleted})
+    assert snapshot.snapshot_name(stamps[0]) in kept  # newest always survives
+    for stamp in stamps:
+        name = snapshot.snapshot_name(stamp)
+        age = NOW - stamp
+        if age < timedelta(days=snapshot.DAILY_RETENTION_DAYS):
+            assert name in kept, f"daily-window snapshot {name} was rotated away"
+        elif age > timedelta(weeks=snapshot.WEEKLY_RETENTION_WEEKS):
+            assert name not in kept or name == snapshot.snapshot_name(stamps[0])
+    # inside the weekly window, exactly one snapshot survives per ISO week
+    weekly = [
+        p
+        for p in snapshot.list_snapshots(snaps)
+        if NOW - snapshot.parse_snapshot_time(p) >= timedelta(days=snapshot.DAILY_RETENTION_DAYS)
+    ]
+    weeks = [snapshot.parse_snapshot_time(p).isocalendar()[:2] for p in weekly]
+    assert len(weeks) == len(set(weeks))
+    assert deleted, "a 6-month spread must rotate something"
+
+
+def test_rotate_keeps_newest_even_when_ancient(tmp_path):
+    snaps = tmp_path / "snaps"
+    made = _touch_snapshots(snaps, [NOW - timedelta(days=900)])
+    assert snapshot.rotate(snaps, now=NOW) == []
+    assert made[0].exists()
+
+
+def test_rotate_ignores_foreign_files(tmp_path):
+    snaps = tmp_path / "snaps"
+    _touch_snapshots(snaps, [NOW - timedelta(days=n) for n in (0, 400, 500)])
+    notes = snaps / "notes.txt"
+    other = snaps / "something.db"
+    desync = snaps / "filingcabinet-notatimestamp.db"
+    for stray in (notes, other, desync):
+        stray.write_bytes(b"keep me")
+
+    snapshot.rotate(snaps, now=NOW)
+
+    assert notes.exists() and other.exists() and desync.exists()
+
+
+def test_parse_snapshot_time_rejects_foreign_names(tmp_path):
+    assert snapshot.parse_snapshot_time("notes.txt") is None
+    assert snapshot.parse_snapshot_time("filingcabinet-nope.db") is None
+    assert snapshot.parse_snapshot_time("filingcabinet-20260601T120000Z.db") == NOW
+
+
+def test_validate_rejects_corrupt_and_unmigrated(tmp_path):
+    garbage = tmp_path / "filingcabinet-20260601T120000Z.db"
+    garbage.write_bytes(b"not a database at all, not even close" * 10)
+    with pytest.raises(snapshot.SnapshotError):
+        snapshot.validate_snapshot(garbage)
+
+    bare = tmp_path / "bare.db"
+    conn = db.connect(bare)
+    conn.execute("CREATE TABLE unrelated (x INTEGER)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(snapshot.SnapshotError):
+        snapshot.validate_snapshot(bare)
+
+    with pytest.raises(snapshot.SnapshotError):
+        snapshot.validate_snapshot(tmp_path / "absent.db")
+
+
+def test_validate_accepts_a_real_snapshot(tmp_path):
+    dbp = _migrated_db(tmp_path / "fc.db")
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    report = snapshot.validate_snapshot(target)
+    assert report["integrity"] == "ok" and "001_init.sql" in report["applied"]
+
+
+def test_round_trip_through_a_spaced_non_ascii_directory(tmp_path):
+    """The whole cycle survives a real-world snapshot path.
+
+    ``snapshot_dir`` is meant to be a cloud-synced folder, which on Windows routinely
+    means something like ``OneDrive - Acme Ltd/FilingCabinet Snapshots``. Validation
+    reaches SQLite as a hand-built ``file:`` URI (``_read_only_uri``), so spaces and
+    non-ASCII characters are a quoting seam a plain temp path never exercises.
+    """
+    dbp = _migrated_db(tmp_path / "My Data (café)" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    snapshot_dir = tmp_path / "OneDrive - Ácme Ltd" / "FilingCabinet Snapshots"
+
+    target = snapshot.create_snapshot(dbp, snapshot_dir, now=NOW)
+    assert target.parent == snapshot_dir and target.is_file()
+    assert snapshot.validate_snapshot(target)["integrity"] == "ok"
+    assert snapshot.list_snapshots(snapshot_dir) == [target]
+
+    result = snapshot.restore_snapshot(dbp, target, now=NOW)
+    assert result["row_counts"]["document"] == 1
+    assert Path(result["rescue_copy"]).is_file()
+
+
+def test_restore_banks_rescue_copy_and_clears_sidecars(tmp_path):
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    _insert_document(dbp, "b" * 64)
+    live_before = dbp.read_bytes()
+    for sidecar in snapshot.sidecar_paths(dbp):
+        sidecar.write_bytes(b"stale")
+
+    result = snapshot.restore_snapshot(dbp, target, now=NOW)
+
+    assert sorted(result["cleared_sidecars"]) == ["fc.db-shm", "fc.db-wal"]
+    for sidecar in snapshot.sidecar_paths(dbp):
+        assert not sidecar.exists() or sidecar.read_bytes() != b"stale"
+    rescue = Path(result["rescue_copy"])
+    assert rescue.exists() and rescue.read_bytes() == live_before
+    assert rescue.parent == dbp.parent / snapshot.RESCUE_DIRNAME
+    conn = db.connect(dbp)
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 1
+    conn.close()
+
+
+def _crash_write_document(path: Path, sha: str) -> None:
+    """Commit a row from a process that dies before SQLite can checkpoint.
+
+    The commit lands in ``<db>-wal`` and the main database file never sees it - what a
+    killed `fc` run or a power cut leaves behind, and exactly the "stale sidecar" state
+    `restore` exists to clear.
+    """
+    stamp = NOW.isoformat(timespec="seconds")
+    code = textwrap.dedent(
+        f"""
+        import os, sqlite3
+        conn = sqlite3.connect({str(path)!r})
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "INSERT INTO document (sha256, size_bytes, first_seen_at, updated_at)"
+            " VALUES (?, ?, ?, ?)",
+            ({sha!r}, {len(sha)}, {stamp!r}, {stamp!r}),
+        )
+        conn.commit()
+        os._exit(0)
+        """
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_rescue_copy_keeps_committed_rows_still_in_the_wal(tmp_path):
+    """The rescue copy must hold everything the replaced index held.
+
+    That includes transactions committed to the ``-wal`` restore is about to delete: a raw
+    file copy of a WAL-mode database does not carry them, which the module docstring
+    already says about snapshots. The rescue copy is the same problem, on the undo path.
+    """
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    _crash_write_document(dbp, "b" * 64)
+
+    wal = Path(str(dbp) + "-wal")
+    assert wal.is_file(), "precondition: the crashed writer left a -wal"
+    assert ("b" * 64).encode() not in dbp.read_bytes(), "precondition: commit is wal-only"
+
+    result = snapshot.restore_snapshot(dbp, target, now=NOW)
+
+    assert not wal.exists(), "restore clears the stale sidecar (AC)"
+    rescue = Path(result["rescue_copy"])
+    conn = sqlite3.connect(f"file:{rescue.as_posix()}?mode=ro", uri=True)
+    try:
+        kept = conn.execute(
+            "SELECT COUNT(*) FROM document WHERE sha256 = ?", ("b" * 64,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert kept == 1, "rescue copy lost a committed row that lived only in the -wal"
+
+
+def test_restore_refuses_while_another_reader_holds_the_index(tmp_path):
+    """A held index cannot be banked faithfully, so restore stops before touching anything.
+
+    The write-ahead log cannot be folded in while someone else is reading (routine on
+    Windows: a second `fc` run, a DB browser, a sync client), so the rescue copy would be
+    incomplete - and the sidecar teardown would die on the lock with a raw traceback.
+    """
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+
+    reader = db.connect(dbp)  # a second process's connection, in miniature
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM document").fetchone()  # pins an older snapshot
+    _insert_document(dbp, "b" * 64)  # ... which the checkpoint now cannot fold in
+    try:
+        with pytest.raises(snapshot.SnapshotError) as excinfo:
+            snapshot.restore_snapshot(dbp, target, now=NOW)
+    finally:
+        reader.close()
+
+    message = str(excinfo.value)
+    assert "write-ahead log could not be folded into" in message
+    assert "nothing has been restored" in message
+    conn = db.connect(dbp)  # the index still holds both rows, the snapshot's and the later one
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 2
+    conn.close()
+    assert not (dbp.parent / snapshot.RESCUE_DIRNAME).exists(), "no stray rescue copy"
+
+
+def test_restore_over_a_corrupt_live_index_still_runs(tmp_path):
+    """Restoring over an unreadable index is a main reason to restore - it must work.
+
+    There is no recoverable write-ahead log behind a corrupt file, so the bank is the
+    bytes as they stand: still the user's undo, still better than nothing.
+    """
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    corrupt = b"not a database at all" * 64
+    dbp.write_bytes(corrupt)
+
+    result = snapshot.restore_snapshot(dbp, target, now=NOW)
+
+    assert result["row_counts"]["document"] == 1
+    assert Path(result["rescue_copy"]).read_bytes() == corrupt
+
+
+def test_restore_without_live_db_records_no_rescue_copy(tmp_path):
+    dbp = _migrated_db(tmp_path / "fc.db")
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    dbp.unlink()
+    result = snapshot.restore_snapshot(dbp, target, now=NOW)
+    assert result["rescue_copy"] is None and dbp.is_file()
+
+
+def test_restore_migrates_forward(tmp_path):
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    real = db.DEFAULT_MIGRATIONS_DIR / "001_init.sql"
+    (migrations / "001_init.sql").write_text(real.read_text(encoding="utf-8"), encoding="utf-8")
+
+    dbp = tmp_path / "fc.db"
+    conn = db.connect(dbp)
+    db.migrate(conn, migrations)
+    conn.close()
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+
+    later = migrations / "099_later.sql"
+    later.write_text("CREATE TABLE later (x INTEGER);\n", encoding="utf-8")
+    result = snapshot.restore_snapshot(dbp, target, now=NOW, migrations_dir=migrations)
+
+    assert result["applied"] == ["099_later.sql"]
+    assert "later" in result["row_counts"]
+
+
+def test_restore_reports_row_counts(tmp_path):
+    dbp = _migrated_db(tmp_path / "fc.db")
+    for n in range(3):
+        _insert_document(dbp, str(n) * 64)
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+
+    result = snapshot.restore_snapshot(dbp, target, now=NOW)
+
+    assert result["row_counts"]["document"] == 3
+    assert result["row_counts"]["schema_migrations"] >= 1
+    assert all(isinstance(v, int) for v in result["row_counts"].values())
+
+
+def test_restore_aborts_before_touching_live_db_on_invalid_snapshot(tmp_path):
+    dbp = _migrated_db(tmp_path / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    before = dbp.read_bytes()
+    bad = tmp_path / "snaps" / "filingcabinet-20260601T120000Z.db"
+    bad.parent.mkdir()
+    bad.write_bytes(b"corrupt" * 100)
+
+    with pytest.raises(snapshot.SnapshotError):
+        snapshot.restore_snapshot(dbp, bad, now=NOW)
+
+    assert dbp.read_bytes() == before
+    assert not (dbp.parent / snapshot.RESCUE_DIRNAME).exists()
+
+
+def test_snapshot_and_restore_touch_no_documents(tmp_path):
+    """Metadata-only invariant (docs/Architecture.md §6): the document root is never written."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    doc = root / "a.pdf"
+    doc.write_bytes(b"alpha")
+    stat_before = (doc.read_bytes(), doc.stat().st_mtime_ns)
+
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    snapshot.restore_snapshot(dbp, target, now=NOW)
+
+    assert list(root.iterdir()) == [doc]
+    assert (doc.read_bytes(), doc.stat().st_mtime_ns) == stat_before
+
+
+def test_restore_twice_in_one_second_keeps_each_rescue_copy(tmp_path):
+    """The rescue copy is the only undo `restore` offers, so it must never be clobbered.
+
+    Two restores inside the same wall-clock second derive the same rescue filename. The
+    second one then overwrites the first one's bank with the post-restore index -- and when
+    the second restore reads *from* that rescue copy (the "I restored the wrong snapshot"
+    recovery), it overwrites its own source and silently no-ops. `create_snapshot` refuses a
+    colliding target for exactly this reason; the rescue path needs the same guard.
+    """
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    _insert_document(dbp, "b" * 64)  # live index diverges from the snapshot
+    live_before = dbp.read_bytes()
+
+    first = snapshot.restore_snapshot(dbp, target, now=NOW)
+    rescue = Path(first["rescue_copy"])
+    assert rescue.read_bytes() == live_before
+
+    second = snapshot.restore_snapshot(dbp, rescue, now=NOW)  # undo, same second
+
+    assert rescue.read_bytes() == live_before, "restore overwrote the rescue copy it read from"
+    assert second["row_counts"]["document"] == 2, "restoring the rescue copy did not undo"
+    assert Path(second["rescue_copy"]) != rescue, "each restore must bank its own rescue copy"
+
+
+def test_restore_twice_same_second_banks_two_distinct_rescue_copies(tmp_path):
+    """Two ordinary restores in one second must not share a rescue filename either.
+
+    The aliasing case above is the loudest symptom; the general rule is that no restore
+    ever overwrites an earlier restore's bank.
+    """
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    older = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    _insert_document(dbp, "b" * 64)
+    newer = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW + timedelta(seconds=1))
+
+    first = snapshot.restore_snapshot(dbp, newer, now=NOW)
+    second = snapshot.restore_snapshot(dbp, older, now=NOW)
+
+    banks = sorted((dbp.parent / snapshot.RESCUE_DIRNAME).glob("*.db"))
+    assert len(banks) == 2, "the second restore overwrote the first restore's bank"
+    assert first["rescue_copy"] != second["rescue_copy"]
+    for bank in banks:  # each bank is a restorable index, not a truncated placeholder
+        assert snapshot.validate_snapshot(bank)["integrity"] == "ok"
+    assert second["row_counts"]["document"] == 1
+
+
+def test_restore_refuses_the_live_index_as_its_own_source(tmp_path):
+    """`restore <the --db path>` is a plausible typo; it must not destroy the index."""
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    before = dbp.read_bytes()
+    for sidecar in snapshot.sidecar_paths(dbp):
+        sidecar.write_bytes(b"stale")
+
+    with pytest.raises(snapshot.SnapshotError) as excinfo:
+        snapshot.restore_snapshot(dbp, dbp, now=NOW)
+
+    assert "itself" in str(excinfo.value)
+    assert dbp.read_bytes() == before
+    # sidecars survive: the guard fires before the teardown (validating the source
+    # read-only may rewrite -shm, so existence, not content, is what is pinned)
+    assert all(s.exists() for s in snapshot.sidecar_paths(dbp))
+    assert not (dbp.parent / snapshot.RESCUE_DIRNAME).exists()
+
+
+def test_restore_refuses_an_aliased_path_to_the_live_index(tmp_path):
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    before = dbp.read_bytes()
+    aliased = tmp_path / "data" / ".." / "data" / "fc.db"
+
+    with pytest.raises(snapshot.SnapshotError):
+        snapshot.restore_snapshot(dbp, aliased, now=NOW)
+
+    assert dbp.read_bytes() == before
+
+
+def test_restore_failure_after_teardown_names_the_rescue_copy(tmp_path):
+    """Nothing past the teardown may escape as a raw traceback: the undo must be told."""
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    real = db.DEFAULT_MIGRATIONS_DIR / "001_init.sql"
+    (migrations / "001_init.sql").write_text(real.read_text(encoding="utf-8"), encoding="utf-8")
+
+    dbp = tmp_path / "fc.db"
+    conn = db.connect(dbp)
+    db.migrate(conn, migrations)
+    conn.close()
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    (migrations / "099_broken.sql").write_text("NOT VALID SQL;\n", encoding="utf-8")
+
+    with pytest.raises(snapshot.SnapshotError) as excinfo:
+        snapshot.restore_snapshot(dbp, target, now=NOW, migrations_dir=migrations)
+
+    message = str(excinfo.value)
+    rescue = next((dbp.parent / snapshot.RESCUE_DIRNAME).glob("*.db"))
+    assert str(rescue) in message and "cleared" in message
+
+
+def test_row_counts_quotes_odd_table_names(tmp_path):
+    dbp = _migrated_db(tmp_path / "fc.db")
+    conn = db.connect(dbp)
+    with conn:
+        conn.execute('CREATE TABLE "evil"" UNION SELECT 1 --" (x INTEGER)')
+        conn.execute('INSERT INTO "evil"" UNION SELECT 1 --" (x) VALUES (1)')
+    counts = snapshot.row_counts(conn)
+    conn.close()
+    assert counts['evil" UNION SELECT 1 --'] == 1

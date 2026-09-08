@@ -106,7 +106,29 @@ Every CLI verb takes `--json`. A thin MCP server wraps the verbs as typed tools:
 `status`, `find`, `dupes`, `propose`, `apply`, `undo`. The engine and CLI need none of the MCP
 dependency; `pip install filingcabinet[mcp]` adds it.
 
-## 8. Instance model and privacy
+## 8. Snapshot and restore (index only)
+
+Independent of the phase chain above — the index needs backup/recovery regardless of which
+phases have landed.
+
+`filingcabinet snapshot` writes a timestamped, consistent copy of the live index to
+`[paths].snapshot_dir` via `VACUUM INTO` (never a raw file copy — WAL mode makes that unsafe).
+Repeated runs rotate: every snapshot from the last 14 days is kept, then the newest per ISO week
+for 12 weeks beyond that; the newest snapshot is never deleted.
+
+`filingcabinet restore latest` (or an explicit snapshot path) validates the chosen file first
+(`PRAGMA integrity_check`, `schema_migrations` present) and aborts before touching anything if
+validation fails. On success it banks a rescue copy of the index it's about to replace under
+`[paths].data_dir/rescue/` (so a restore is itself undoable), clears stale `-wal`/`-shm`
+sidecars left by the replaced index, runs forward migrations so an older snapshot lands on the
+current schema, and reports row counts per table. Neither verb reads or writes anything under
+`[paths].root` — both operate on the index only.
+
+`[paths].snapshot_dir` is trusted storage, not just a backup location: `restore latest` installs
+whatever file parses as the newest snapshot there, so keep it on a synced folder only you write
+to.
+
+## 9. Instance model and privacy
 
 - **Framework repo (this one):** public-capable. `.gitignore` blocks document formats and
   databases; `npm run check:docs` fails CI on any tracked offender.
@@ -118,7 +140,7 @@ dependency; `pip install filingcabinet[mcp]` adds it.
 - **pemr:** independent. Both projects use sha256 content IDs, so a later bridge (pemr
   referencing a FilingCabinet document) is a lookup, not a dependency. No shared code or DB.
 
-## 9. Open questions
+## 10. Open questions
 
 - Local-to-Drive drift that has not synced down as a file needs the Drive API. Deferred.
 - Windows OCR toolchain (tesseract, Ghostscript) install and a `doctor` verb. See

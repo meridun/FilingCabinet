@@ -1,6 +1,6 @@
 """`filingcabinet` (alias `fc`) command-line entry point.
 
-Verbs: migrate, status, ingest, dupes, instance.
+Verbs: migrate, status, ingest, dupes, snapshot, restore, instance.
 
 DB path resolution: --db flag > FC_DB env var > config.toml [paths].data_dir + /filingcabinet.db.
 Config path resolution: --config flag > FC_CONFIG env var > ./config.toml.
@@ -16,7 +16,14 @@ import sys
 import tomllib
 from pathlib import Path
 
-from . import __version__, db, dedup as dedup_mod, ingest as ingest_mod, instance as instance_mod
+from . import (
+    __version__,
+    db,
+    dedup as dedup_mod,
+    ingest as ingest_mod,
+    instance as instance_mod,
+    snapshot as snapshot_mod,
+)
 
 DB_FILENAME = "filingcabinet.db"
 
@@ -60,6 +67,20 @@ def resolve_root(args: argparse.Namespace) -> Path:
     if not path.is_dir():
         raise SystemExit(f"error: document root {path} is not a directory")
     return path
+
+
+def resolve_snapshot_dir(args: argparse.Namespace) -> Path:
+    """Snapshot dir: --snapshot-dir flag > FC_SNAPSHOT_DIR env > config [paths].snapshot_dir."""
+    snapshot_dir = getattr(args, "snapshot_dir", None) or os.environ.get("FC_SNAPSHOT_DIR")
+    if not snapshot_dir:
+        config = load_config(args.config)
+        snapshot_dir = config.get("paths", {}).get("snapshot_dir")
+    if not snapshot_dir:
+        raise SystemExit(
+            "error: no snapshot directory - pass --snapshot-dir, set FC_SNAPSHOT_DIR, or set "
+            "[paths].snapshot_dir in config.toml (see config.example.toml)"
+        )
+    return Path(snapshot_dir)
 
 
 def _emit(args: argparse.Namespace, payload: dict, text: str) -> None:
@@ -182,6 +203,64 @@ def cmd_dupes_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    db_path = _require_database(args)
+    snapshot_dir = resolve_snapshot_dir(args)
+    target = snapshot_mod.create_snapshot(db_path, snapshot_dir)
+    rotated = [] if args.no_rotate else snapshot_mod.rotate(snapshot_dir)
+    _emit(
+        args,
+        {
+            "db": str(db_path),
+            "snapshot": str(target),
+            "snapshot_dir": str(snapshot_dir),
+            "rotated": [str(p) for p in rotated],
+        },
+        f"{target}: snapshot written, {len(rotated)} rotated",
+    )
+    return 0
+
+
+def _resolve_restore_source(args: argparse.Namespace) -> Path:
+    if args.target == "latest":
+        snapshot_dir = resolve_snapshot_dir(args)
+        snapshots = snapshot_mod.list_snapshots(snapshot_dir)
+        if not snapshots:
+            raise SystemExit(
+                f"error: no snapshots in {snapshot_dir} - run `filingcabinet snapshot` first"
+            )
+        return snapshots[0]
+    source = Path(args.target)
+    if not source.is_file():
+        raise SystemExit(f"error: no snapshot file at {source}")
+    return source
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    """Replace the live index with a snapshot. Destructive to the index only, never to docs."""
+    db_path = resolve_db_path(args)
+    source = _resolve_restore_source(args)
+    if args.dry_run:
+        report = snapshot_mod.validate_snapshot(source)
+        _emit(
+            args,
+            {"db": str(db_path), "dry_run": True, **report},
+            f"{source}: valid snapshot ({len(report['applied'])} migration(s) applied); "
+            f"would replace {db_path}",
+        )
+        return 0
+    result = snapshot_mod.restore_snapshot(db_path, source)
+    counts = result["row_counts"]
+    detail = ", ".join(f"{name}={n}" for name, n in counts.items()) or "no tables"
+    _emit(
+        args,
+        result,
+        f"{db_path}: restored from {source}, applied {len(result['applied'])} migration(s); "
+        f"{detail}",
+    )
+    return 0
+
+
 def cmd_dupes_label(args: argparse.Namespace) -> int:
     db_path = _require_database(args)
     conn = db.connect(db_path)
@@ -247,6 +326,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"filingcabinet {__version__}")
     parser.add_argument("--db", help="index database path (overrides FC_DB and config)")
     parser.add_argument("--config", help="config.toml path (overrides FC_CONFIG)")
+    parser.add_argument(
+        "--snapshot-dir", help="snapshot directory (overrides FC_SNAPSHOT_DIR and config)"
+    )
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -260,6 +342,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ingest", help="scan the document root and index new or changed files")
     p.add_argument("--root", help="document root (overrides FC_ROOT and config)")
     p.set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser("snapshot", help="write a VACUUM INTO snapshot of the index")
+    p.add_argument("--no-rotate", action="store_true", help="keep every existing snapshot")
+    p.set_defaults(func=cmd_snapshot)
+
+    p = sub.add_parser("restore", help="replace the live index with a snapshot")
+    p.add_argument("target", help="`latest` or the path to a snapshot file")
+    p.add_argument("--dry-run", action="store_true", help="validate and report, change nothing")
+    p.set_defaults(func=cmd_restore)
 
     p = sub.add_parser("dupes", help="duplicate detection: report tiers, label the sample")
     dupes_sub = p.add_subparsers(dest="dupes_command", required=True)
@@ -296,7 +387,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except db.NotMigratedError as exc:
+    except (db.NotMigratedError, snapshot_mod.SnapshotError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
