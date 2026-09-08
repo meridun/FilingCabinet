@@ -355,7 +355,10 @@ def test_ocr_run_json_summary(tmp_path, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["ladder"] == ["local", "vision"] and out["min_confidence"] == 0.75
     assert out["errors"] == 1 and out["documents"] == 0
-    assert all(isinstance(out[key], int) for key in ("documents", "pages", "ok", "errors"))
+    assert all(
+        isinstance(out[key], int)
+        for key in ("documents", "pages", "ok", "degraded", "errors")
+    )
 
 
 def test_ocr_ladder_from_config(tmp_path, capsys):

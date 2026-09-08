@@ -333,7 +333,8 @@ def cmd_ocr_run(args: argparse.Namespace) -> int:
         payload,
         f"{root}: {summary.documents} document(s), {summary.pages} page(s) - {summary.ok} ok, "
         f"{summary.pending_vision} pending vision, {summary.skipped} skipped, "
-        f"{summary.exhausted} exhausted, {summary.errors} error(s)",
+        f"{summary.exhausted} exhausted, {summary.degraded} degraded (toolchain), "
+        f"{summary.errors} error(s)",
     )
     return 0
 

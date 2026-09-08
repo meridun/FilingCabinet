@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from filingcabinet import db, ocr
+from filingcabinet import db, ocr, search
 
 NOW = "2026-01-01T00:00:00.000000+00:00"
 
@@ -201,20 +201,25 @@ def test_rerun_skips_confident_pages(conn, tmp_path, monkeypatch):
             pytest.fail("a page at/above min_confidence was re-read")
         return ""
 
+    # Page 1 is done and never re-read; page 2 was skipped because tesseract is absent, which
+    # is an environment reason, so it stays retryable rather than being written off.
     second = ocr.run_ocr(conn, root, config=config, extractor=extractor, now=NOW)
-    assert second.pages == 0  # page 1 is done, page 2's ladder is spent
+    assert (second.pages, second.skipped, second.degraded) == (1, 1, 1)
     assert _pages(conn, document_id)[0]["status"] == "ok"
 
 
 @requires_pymupdf
 def test_sub_threshold_page_re_escalates_to_the_next_rung(conn, indexed, monkeypatch):
+    """A rung that ran and read too little is finished with: the next pass resumes above it."""
     root, document_id = indexed
-    monkeypatch.setattr(ocr, "tesseract_version", lambda: None)
+    monkeypatch.setattr(ocr, "tesseract_version", lambda: "tesseract v5.4.0")
+    monkeypatch.setattr(ocr, "_render_page", lambda page, tmp_dir: Path(tmp_dir) / "page-1.png")
     ocr.run_ocr(
         conn,
         root,
         config=ocr.OcrConfig(ladder=("local",), min_confidence=0.75),
         extractor=lambda page: "",
+        runner=lambda image_path: ("blurry", 0.2),
         now=NOW,
     )
     assert _pages(conn, document_id)[0]["rung"] == "local"
@@ -228,7 +233,102 @@ def test_sub_threshold_page_re_escalates_to_the_next_rung(conn, indexed, monkeyp
         now=NOW,
     )
     assert (summary.pages, summary.pending_vision) == (1, 1)
-    assert _pages(conn, document_id)[0]["rung"] == "vision"
+    page = _pages(conn, document_id)[0]
+    assert page["rung"] == "vision"
+    assert page["text"] == "blurry"  # the read that got this far is kept, not blanked
+
+
+@requires_pymupdf
+def test_tesseract_absent_under_the_default_ladder_keeps_the_reason(conn, indexed, monkeypatch):
+    """The deferral to vision must not erase why the local rung produced nothing.
+
+    `[ocr].ladder` ships as ("local", "vision"), so this - not a single-rung ladder - is what an
+    operator on a tesseract-less host actually runs.
+    """
+    root, document_id = indexed
+    monkeypatch.setattr(ocr, "tesseract_version", lambda: None)
+    summary = ocr.run_ocr(
+        conn,
+        root,
+        config=ocr.OcrConfig(),  # the shipped default ladder
+        extractor=lambda page: "",
+        runner=_never_called,
+        now=NOW,
+    )
+    assert (summary.pages, summary.pending_vision, summary.degraded) == (1, 1, 1)
+    assert summary.errors == 0
+    page = _pages(conn, document_id)[0]
+    assert (page["status"], page["rung"], page["note"]) == (
+        "pending_vision",
+        "vision",
+        "tesseract_missing",
+    )
+
+
+@requires_pymupdf
+def test_page_skipped_for_a_missing_toolchain_recovers_when_it_appears(
+    conn, indexed, monkeypatch
+):
+    """`doctor` tells the operator to install tesseract; the re-run after they do must read the
+    page instead of reporting nothing to do."""
+    root, document_id = indexed
+    monkeypatch.setattr(ocr, "tesseract_version", lambda: None)
+    ocr.run_ocr(conn, root, config=ocr.OcrConfig(), extractor=lambda page: "", now=NOW)
+    assert _pages(conn, document_id)[0]["note"] == "tesseract_missing"
+
+    monkeypatch.setattr(ocr, "tesseract_version", lambda: "tesseract v5.4.0")
+    monkeypatch.setattr(ocr, "_render_page", lambda page, tmp_dir: Path(tmp_dir) / "page-1.png")
+    summary = ocr.run_ocr(
+        conn,
+        root,
+        config=ocr.OcrConfig(),
+        extractor=lambda page: "",
+        runner=lambda image_path: (CLEAN_TEXT, 0.92),
+        now=NOW,
+    )
+    assert (summary.pages, summary.ok, summary.degraded) == (1, 1, 0)
+    page = _pages(conn, document_id)[0]
+    assert (page["status"], page["rung"], page["ocr_source"]) == (
+        "ok",
+        "local",
+        "local_tesseract",
+    )
+    assert page["text"] == CLEAN_TEXT
+
+
+@requires_pymupdf
+def test_raising_min_confidence_keeps_the_indexed_text(conn, indexed, monkeypatch):
+    """Re-escalation changes a page's status, never its content: a config change alone must not
+    drop a document out of the search index."""
+    root, document_id = indexed
+    monkeypatch.setattr(ocr, "tesseract_version", lambda: None)
+    text = CLEAN_TEXT[:150]  # dense enough to clear 0.5, not dense enough to clear 0.99
+    ocr.run_ocr(
+        conn,
+        root,
+        config=ocr.OcrConfig(ladder=("local", "vision"), min_confidence=0.5),
+        extractor=lambda page: text,
+        runner=_never_called,
+        now=NOW,
+    )
+    assert _pages(conn, document_id)[0]["status"] == "ok"
+    assert [hit.document_id for hit in search.find(conn, "northwind")] == [document_id]
+
+    summary = ocr.run_ocr(
+        conn,
+        root,
+        config=ocr.OcrConfig(ladder=("local", "vision"), min_confidence=0.99),
+        extractor=_never_called,
+        now=NOW,
+    )
+    assert (summary.pages, summary.pending_vision) == (1, 1)
+    page = _pages(conn, document_id)[0]
+    assert page["status"] == "pending_vision" and page["text"] == text
+    stored = conn.execute(
+        "SELECT ocr_text, ocr_source FROM document WHERE document_id = ?", (document_id,)
+    ).fetchone()
+    assert stored["ocr_text"] == text and stored["ocr_source"] == "local"
+    assert [hit.document_id for hit in search.find(conn, "northwind")] == [document_id]
 
 
 @requires_pymupdf

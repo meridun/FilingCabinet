@@ -7,7 +7,11 @@ and is skipped with a recorded reason rather than treated as an error.
 
 A page is done when its recorded confidence reaches `[ocr].min_confidence`; a page below it
 resumes at the rung *after* the one recorded, so re-runs strictly advance and a page whose
-ladder is spent settles at `exhausted` instead of being retried forever.
+ladder is spent settles at `exhausted` instead of being retried forever. The exception is a rung
+that was *unavailable* rather than insufficient (no tesseract, an unimplemented rung): the reason
+is recorded on the page and that rung is retried on the next run, so installing the toolchain a
+`doctor` report asked for actually fixes the page. Re-escalation never blanks an indexed page: a
+deferral moves the ladder bookkeeping and keeps the text already read.
 
 Read-only on the document tree - pages are opened read-only and rasterized into an OS
 temporary directory, never under [paths].root (docs/Architecture.md §6); every write lands in
@@ -43,6 +47,12 @@ STATUS_OK = "ok"
 STATUS_PENDING_VISION = "pending_vision"
 STATUS_SKIPPED = "skipped"
 STATUS_EXHAUSTED = "exhausted"
+
+# Notes record *why* a rung produced nothing. An availability reason (the toolchain or the rung
+# itself is missing) describes the environment, not the page, so it is retryable; a quality
+# reason (a thin or garbled read) is not - that is what the strictly-advancing resume rule is for.
+NOTE_TESSERACT_MISSING = "tesseract_missing"
+NOTE_RUNG_UNAVAILABLE = "rung_unavailable:"
 
 # page_ocr.ocr_source is the fine vocabulary; document.ocr_source keeps §5's coarse one.
 _COARSE_SOURCE = {
@@ -91,6 +101,10 @@ class OcrSummary:
     pending_vision: int = 0
     skipped: int = 0
     exhausted: int = 0
+    # Pages whose recorded reason is an unavailable rung: the operator-facing signal that the run
+    # degraded for an environment reason (KNOWN_ENV_LIMITS - tesseract may be absent) rather than
+    # because the pages were unreadable. Counted alongside the statuses, never instead of them.
+    degraded: int = 0
     errors: int = 0
 
     def as_dict(self) -> dict:
@@ -120,6 +134,7 @@ def _merge(a: OcrSummary, b: OcrSummary) -> OcrSummary:
         pending_vision=a.pending_vision + b.pending_vision,
         skipped=a.skipped + b.skipped,
         exhausted=a.exhausted + b.exhausted,
+        degraded=a.degraded + b.degraded,
         errors=a.errors + b.errors,
     )
 
@@ -263,7 +278,7 @@ def _rung_local(
 
     layer = PageResult(text=text or None, confidence=confidence, rung="local")
     if tesseract_version() is None:
-        return replace(layer, status=STATUS_SKIPPED, note="tesseract_missing")
+        return replace(layer, status=STATUS_SKIPPED, note=NOTE_TESSERACT_MISSING)
     image_path = _render_page(page, tmp_dir)
     if image_path is None:
         return replace(layer, status=STATUS_SKIPPED, note="render_failed")
@@ -290,10 +305,42 @@ def _rung_vision(page, **_kwargs) -> PageResult:
 RUNGS: dict[str, Callable[..., PageResult]] = {"local": _rung_local, "vision": _rung_vision}
 
 
+def _row_note(row) -> str | None:
+    """The row's note, tolerating a row selected without that column."""
+    try:
+        return row["note"]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def _unavailable_rung(note: str | None) -> str | None:
+    """The rung a note says could not run at all, or None for a quality reason.
+
+    `tesseract_missing` and `rung_unavailable:<name>` are properties of the environment, so the
+    page is not finished with that rung - it never got to try it.
+    """
+    if not note:
+        return None
+    if note == NOTE_TESSERACT_MISSING:
+        return "local"
+    if note.startswith(NOTE_RUNG_UNAVAILABLE):
+        return note[len(NOTE_RUNG_UNAVAILABLE) :] or None
+    return None
+
+
 def _resume_index(ladder: tuple[str, ...], row: sqlite3.Row | None) -> int:
-    """The ladder index to resume at: the rung after the one recorded, or 0 for a new page."""
+    """The ladder index to resume at: the rung after the one recorded, or 0 for a new page.
+
+    One exception to "strictly after": a page whose recorded note names a rung that was
+    *unavailable* resumes **at** that rung, so a toolchain installed since the last run is
+    actually used. The re-attempt is a cheap no-op while the rung stays unavailable, and the
+    walk still advances past it, so nothing loops.
+    """
     if row is None or not row["rung"]:
         return 0
+    blocked = _unavailable_rung(_row_note(row))
+    if blocked is not None and blocked in ladder:
+        return ladder.index(blocked)
     try:
         return ladder.index(row["rung"]) + 1
     except ValueError:  # the ladder changed under us: start over rather than guess
@@ -325,10 +372,14 @@ def walk_ladder(
     best = PageResult()
     have_best = False
     last: PageResult | None = None
+    carry_note: str | None = None
     for name in config.ladder[start_index:]:
         rung = RUNGS.get(name)
         if rung is None:
-            last = PageResult(rung=name, status=STATUS_SKIPPED, note=f"rung_unavailable:{name}")
+            last = PageResult(
+                rung=name, status=STATUS_SKIPPED, note=f"{NOTE_RUNG_UNAVAILABLE}{name}"
+            )
+            carry_note = last.note
             continue
         result = rung(
             page,
@@ -338,12 +389,22 @@ def walk_ladder(
             runner=runner,
         )
         last = result
+        if _unavailable_rung(result.note) is not None:
+            carry_note = result.note
         if result.status == STATUS_PENDING_VISION:
-            # Carry the best read so far, so a partial local read is not lost while the
-            # page waits for an agent.
+            # Carry the best read so far, so a partial local read is not lost while the page
+            # waits for an agent - and carry the reason an earlier rung could not run, so a
+            # missing toolchain stays visible (and retryable) on the deferred row instead of
+            # being erased by the deferral.
             if have_best:
-                return replace(result, text=best.text, confidence=best.confidence)
-            return result
+                return replace(
+                    result,
+                    text=best.text,
+                    confidence=best.confidence,
+                    ocr_source=best.ocr_source,
+                    note=carry_note or result.note,
+                )
+            return replace(result, note=carry_note or result.note)
         if not have_best or result.confidence > best.confidence:
             best, have_best = result, True
         if result.confidence >= config.min_confidence:
@@ -355,12 +416,42 @@ def walk_ladder(
         best,
         status=STATUS_EXHAUSTED,
         rung=last.rung if last is not None else best.rung,
+        note=carry_note or best.note,
+    )
+
+
+def _keep_earlier_read(
+    conn: sqlite3.Connection, document_id: int, page_number: int, result: PageResult
+) -> PageResult:
+    """Never blank an indexed page: a deferral or a skip changes status, not content.
+
+    A re-escalation - the operator raised `[ocr].min_confidence`, or the ladder grew a rung -
+    resumes above the rung that did the reading, so its result carries no text of its own.
+    Writing that over the stored read would drop the document out of the FTS index on a config
+    change alone, so the earlier text, its confidence and its source are kept and only the ladder
+    bookkeeping moves.
+    """
+    if result.text and result.text.strip():
+        return result
+    row = conn.execute(
+        "SELECT text, confidence, ocr_source FROM page_ocr "
+        "WHERE document_id = ? AND page_number = ?",
+        (document_id, page_number),
+    ).fetchone()
+    if row is None or not row["text"] or not str(row["text"]).strip():
+        return result
+    return replace(
+        result,
+        text=row["text"],
+        confidence=max(float(result.confidence), float(row["confidence"] or 0.0)),
+        ocr_source=result.ocr_source or row["ocr_source"],
     )
 
 
 def _upsert_page(
     conn: sqlite3.Connection, document_id: int, page_number: int, result: PageResult, now: str
 ) -> None:
+    result = _keep_earlier_read(conn, document_id, page_number, result)
     conn.execute(
         """
         INSERT INTO page_ocr (document_id, page_number, text, confidence, rung, ocr_source,
@@ -429,12 +520,14 @@ def ocr_document(
     existing = {
         row["page_number"]: row
         for row in conn.execute(
-            "SELECT page_number, confidence, rung, status FROM page_ocr WHERE document_id = ?",
+            "SELECT page_number, confidence, rung, status, note FROM page_ocr "
+            "WHERE document_id = ?",
             (document_id,),
         )
     }
     counts = {STATUS_OK: 0, STATUS_PENDING_VISION: 0, STATUS_SKIPPED: 0, STATUS_EXHAUSTED: 0}
     pages = 0
+    degraded = 0
     with tempfile.TemporaryDirectory(prefix="fc-ocr-") as tmp:
         tmp_dir = Path(tmp)  # never under [paths].root (docs/Architecture.md §6)
         with _fitz.open(path) as document:
@@ -456,6 +549,8 @@ def ocr_document(
                     _upsert_page(conn, document_id, page_number, result, stamp)
                 pages += 1
                 counts[result.status] = counts.get(result.status, 0) + 1
+                if _unavailable_rung(result.note) is not None:
+                    degraded += 1
     if pages:
         with conn:
             roll_up_document(conn, document_id, stamp)
@@ -466,6 +561,7 @@ def ocr_document(
         pending_vision=counts[STATUS_PENDING_VISION],
         skipped=counts[STATUS_SKIPPED],
         exhausted=counts[STATUS_EXHAUSTED],
+        degraded=degraded,
     )
 
 

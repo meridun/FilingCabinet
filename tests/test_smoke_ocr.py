@@ -103,7 +103,9 @@ def test_ocr_smoke_end_to_end(tmp_path):
     assert hit["rel_path"] == "invoice.pdf" and "[Northwind]" in hit["snippet"]
 
     second = _run(db, "ocr", "run", "--root", str(root))
-    assert second["pages"] == 0  # resumable: nothing left to do on a second pass
+    # Resumable: a settled page is never re-read. A page parked because the toolchain was
+    # missing stays retryable, so on a tesseract-less host the blank page is attempted again.
+    assert second["ok"] == 0 and second["pages"] <= 1
 
     # The blank page has no text to search for, so its id comes from the index directly -
     # every action below is still the real CLI in a real subprocess.
