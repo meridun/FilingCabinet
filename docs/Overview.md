@@ -29,6 +29,7 @@ the logic on every request.
 | Rules, classification, and naming proposals | Architecture.md § Organize | 5 |
 | Apply plans, move-log, undo | Architecture.md § Organize | 6 |
 | MCP wrapper (agent surface) | Architecture.md § Agent surface | 7 |
+| Snapshot + restore of the index | Architecture.md § Snapshot and restore | - |
 | graphify experiment (cross-document entity linking) | Architecture.md § Open questions | 8 |
 
 Local setup, commands, and the branch model: [Development.md](Development.md). Shared repo
