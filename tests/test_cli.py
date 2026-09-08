@@ -345,8 +345,13 @@ def test_dupes_label_pair_needs_kind_and_verdict(tmp_path, capsys):
         cli.main(["--db", dbp, "dupes", "label", "--pair", str(a), str(b)])
 
 
+@pytest.mark.skipif(ocr.pymupdf_version() is None, reason="optional `ocr` extra (PyMuPDF)")
 def test_ocr_run_json_summary(tmp_path, capsys):
-    """`a.pdf` is not really a PDF, so this also covers the unopenable-document path."""
+    """`a.pdf` is not really a PDF, so this also covers the unopenable-document path.
+
+    Without PyMuPDF the run degrades to `skipped` before any document is opened, so the
+    error count is only meaningful with the `ocr` extra installed (CI installs the bare package).
+    """
     dbp = _migrated_db(tmp_path, capsys)
     root = _make_root(tmp_path)
     assert cli.main(["--db", dbp, "--json", "ingest", "--root", str(root)]) == 0
