@@ -24,7 +24,10 @@ needed unless ocrmypdf is adopted). On Windows:
 winget install UB-Mannheim.TesseractOCR
 ```
 
-Without it, OCR degrades to embedded text layers only and reports which pages were skipped.
+Without it, OCR degrades to embedded text layers only: a rasterized page is left `pending_vision`
+with `note='tesseract_missing'` and counted in `ocr run --json`'s `degraded` total, never an
+error. `filingcabinet doctor` reports whether tesseract is on `PATH`. Installing tesseract and
+re-running `ocr run` picks those pages back up automatically.
 
 ## Tests
 
