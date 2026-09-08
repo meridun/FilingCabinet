@@ -295,3 +295,66 @@ def test_restore_twice_same_second_banks_two_distinct_rescue_copies(tmp_path):
     for bank in banks:  # each bank is a restorable index, not a truncated placeholder
         assert snapshot.validate_snapshot(bank)["integrity"] == "ok"
     assert second["row_counts"]["document"] == 1
+
+
+def test_restore_refuses_the_live_index_as_its_own_source(tmp_path):
+    """`restore <the --db path>` is a plausible typo; it must not destroy the index."""
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    before = dbp.read_bytes()
+    for sidecar in snapshot.sidecar_paths(dbp):
+        sidecar.write_bytes(b"stale")
+
+    with pytest.raises(snapshot.SnapshotError) as excinfo:
+        snapshot.restore_snapshot(dbp, dbp, now=NOW)
+
+    assert "itself" in str(excinfo.value)
+    assert dbp.read_bytes() == before
+    # sidecars survive: the guard fires before the teardown (validating the source
+    # read-only may rewrite -shm, so existence, not content, is what is pinned)
+    assert all(s.exists() for s in snapshot.sidecar_paths(dbp))
+    assert not (dbp.parent / snapshot.RESCUE_DIRNAME).exists()
+
+
+def test_restore_refuses_an_aliased_path_to_the_live_index(tmp_path):
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    before = dbp.read_bytes()
+    aliased = tmp_path / "data" / ".." / "data" / "fc.db"
+
+    with pytest.raises(snapshot.SnapshotError):
+        snapshot.restore_snapshot(dbp, aliased, now=NOW)
+
+    assert dbp.read_bytes() == before
+
+
+def test_restore_failure_after_teardown_names_the_rescue_copy(tmp_path):
+    """Nothing past the teardown may escape as a raw traceback: the undo must be told."""
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    real = db.DEFAULT_MIGRATIONS_DIR / "001_init.sql"
+    (migrations / "001_init.sql").write_text(real.read_text(encoding="utf-8"), encoding="utf-8")
+
+    dbp = tmp_path / "fc.db"
+    conn = db.connect(dbp)
+    db.migrate(conn, migrations)
+    conn.close()
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    (migrations / "099_broken.sql").write_text("NOT VALID SQL;\n", encoding="utf-8")
+
+    with pytest.raises(snapshot.SnapshotError) as excinfo:
+        snapshot.restore_snapshot(dbp, target, now=NOW, migrations_dir=migrations)
+
+    message = str(excinfo.value)
+    rescue = next((dbp.parent / snapshot.RESCUE_DIRNAME).glob("*.db"))
+    assert str(rescue) in message and "cleared" in message
+
+
+def test_row_counts_quotes_odd_table_names(tmp_path):
+    dbp = _migrated_db(tmp_path / "fc.db")
+    conn = db.connect(dbp)
+    with conn:
+        conn.execute('CREATE TABLE "evil"" UNION SELECT 1 --" (x INTEGER)')
+        conn.execute('INSERT INTO "evil"" UNION SELECT 1 --" (x) VALUES (1)')
+    counts = snapshot.row_counts(conn)
+    conn.close()
+    assert counts['evil" UNION SELECT 1 --'] == 1

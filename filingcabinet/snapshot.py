@@ -174,6 +174,12 @@ def validate_snapshot(path: str | Path) -> dict:
     return {"path": str(source), "applied": applied, "integrity": "ok"}
 
 
+def _quote_identifier(name: str) -> str:
+    """SQLite-quote a table name from ``sqlite_master`` (embedded quotes doubled)."""
+    escaped = name.replace('"', '""')
+    return f'"{escaped}"'
+
+
 def row_counts(conn: sqlite3.Connection) -> dict[str, int]:
     """``COUNT(*)`` per user table, by table name."""
     names = sorted(
@@ -183,9 +189,26 @@ def row_counts(conn: sqlite3.Connection) -> dict[str, int]:
         )
     )
     return {
-        name: conn.execute(f'SELECT COUNT(*) AS n FROM "{name}"').fetchone()["n"]
+        name: conn.execute(f"SELECT COUNT(*) AS n FROM {_quote_identifier(name)}").fetchone()["n"]
         for name in names
     }
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    """True if both paths name the same file, whether or not they both exist.
+
+    ``samefile`` is the accurate answer (it sees hard links and junctions) but needs both
+    files present; ``resolve`` covers the rest, including the destination-missing case.
+    """
+    try:
+        if left.samefile(right):
+            return True
+    except OSError:
+        pass
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:  # pragma: no cover - resolve is non-strict; guard the exotic cases
+        return False
 
 
 def sidecar_paths(db_path: str | Path) -> list[Path]:
@@ -231,6 +254,11 @@ def restore_snapshot(
     db_path = Path(db_path)
     source = Path(source)
     validate_snapshot(source)  # abort before touching anything
+    if _same_file(source, db_path):
+        raise SnapshotError(
+            f"refusing to restore {db_path} from itself: {source} is the live index, "
+            "not a snapshot - restore needs a separate file (try `restore latest`)"
+        )
 
     rescue_copy: Path | None = None
     if db.database_exists(db_path):
@@ -247,15 +275,24 @@ def restore_snapshot(
             cleared.append(sidecar.name)
     db_path.unlink(missing_ok=True)
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, db_path)  # copy, never move: the snapshot stays in snapshot_dir
-
-    conn = db.connect(db_path)
+    # Past this point the live index is gone, so every failure is reported as a
+    # SnapshotError naming the rescue copy - the user's undo - instead of a raw traceback.
     try:
-        applied = db.migrate(conn, migrations_dir)
-        counts = row_counts(conn)
-    finally:
-        conn.close()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, db_path)  # copy, never move: the snapshot stays in snapshot_dir
+
+        conn = db.connect(db_path)
+        try:
+            applied = db.migrate(conn, migrations_dir)
+            counts = row_counts(conn)
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        undo = f"; the replaced index is banked at {rescue_copy}" if rescue_copy else ""
+        raise SnapshotError(
+            f"restore of {db_path} from {source} failed after the old index was "
+            f"cleared: {exc}{undo}"
+        ) from exc
 
     return {
         "db": str(db_path),

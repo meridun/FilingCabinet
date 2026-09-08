@@ -190,3 +190,17 @@ def test_restore_invalid_snapshot_exits_two(tmp_path, capsys):
     assert cli.main(["--db", str(dbp), "restore", str(bad)]) == 2
     assert "error:" in capsys.readouterr().err
     assert dbp.read_bytes() == before
+
+
+def test_restore_from_the_live_db_path_exits_two_and_keeps_the_index(tmp_path, capsys):
+    dbp = tmp_path / "fc.db"
+    assert cli.main(["--db", str(dbp), "migrate", "--create"]) == 0
+    before = dbp.read_bytes()
+    capsys.readouterr()
+
+    assert cli.main(["--db", str(dbp), "restore", str(dbp)]) == 2
+
+    err = capsys.readouterr().err
+    assert "error:" in err and "itself" in err
+    assert dbp.read_bytes() == before
+    assert not (tmp_path / "rescue").exists()
