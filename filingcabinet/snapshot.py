@@ -37,6 +37,10 @@ SIDECAR_SUFFIXES = ("-wal", "-shm")
 RESCUE_DIRNAME = "rescue"
 # How many same-stamp rescue names to try before giving up (see _claim_rescue_path).
 RESCUE_COLLISION_LIMIT = 100
+# How long to wait for another process to let go of the live index before refusing to
+# restore (see _checkpoint_for_rescue). Long enough to ride out a sync or AV client
+# touching the file, short enough that a genuinely held index reports promptly.
+RESCUE_CHECKPOINT_TIMEOUT_SECONDS = 2.0
 
 
 class SnapshotError(RuntimeError):
@@ -239,6 +243,53 @@ def _claim_rescue_path(rescue_dir: Path, db_path: Path, stamp: str) -> Path:
     )
 
 
+def _index_in_use_error(db_path: Path, detail: object) -> SnapshotError:
+    return SnapshotError(
+        f"refusing to restore over {db_path}: its write-ahead log could not be folded into "
+        f"the index, so the rescue copy would not be a complete undo ({detail}). Close any "
+        "other process holding the index and retry - nothing has been restored and the "
+        "index still holds everything it did"
+    )
+
+
+def _checkpoint_for_rescue(db_path: Path) -> None:
+    """Fold the live index's write-ahead log into the database file, before it is copied.
+
+    ``shutil.copy2`` of a WAL-mode database carries only the main file. A transaction a
+    crashed writer committed lives on in ``<db>-wal`` - which restore then deletes - so
+    without this the rescue copy, the only undo restore offers, silently loses committed
+    rows. That crash leftover is the very state the sidecar clearing exists for, and
+    metadata the index holds (OCR text, dates, parties) is not rebuildable by re-ingest.
+
+    Raises :class:`SnapshotError` when another process holds the index: the log cannot be
+    folded in, so the bank would be incomplete - and the teardown below would fail on the
+    locked sidecars anyway. An index too damaged to open has no recoverable log either, and
+    restoring over a corrupt index is a reason to be here, so that one is banked as-is.
+    """
+    try:
+        conn = sqlite3.connect(db_path, timeout=RESCUE_CHECKPOINT_TIMEOUT_SECONDS)
+    except sqlite3.Error:  # pragma: no cover - connect defers almost every failure
+        return
+    try:
+        busy, _log, _checkpointed = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.OperationalError as exc:  # locked, busy, read-only
+        raise _index_in_use_error(db_path, exc) from exc
+    except sqlite3.DatabaseError:
+        return  # not a readable database: nothing to fold in, bank the bytes as they are
+    finally:
+        conn.close()
+    if busy:
+        raise _index_in_use_error(db_path, "the checkpoint could not complete")
+
+
+def _discard(path: Path) -> None:
+    """Best-effort removal of a file this call created and no longer wants."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - the caller is already reporting a failure
+        pass
+
+
 def restore_snapshot(
     db_path: str | Path,
     source: str | Path,
@@ -248,8 +299,10 @@ def restore_snapshot(
 ) -> dict:
     """Replace the live index with ``source``. Validation first, rescue copy second.
 
-    No connection to the live index is open while its sidecars are cleared - deleting a
-    ``-wal`` out from under an open connection loses committed data.
+    The rescue copy is taken after the live index is checkpointed, so it carries the
+    commits that live only in the ``-wal`` this call goes on to delete. No connection to
+    the live index is open while its sidecars are cleared - deleting a ``-wal`` out from
+    under an open connection loses committed data.
     """
     db_path = Path(db_path)
     source = Path(source)
@@ -260,20 +313,41 @@ def restore_snapshot(
             "not a snapshot - restore needs a separate file (try `restore latest`)"
         )
 
+    # Inventory the sidecars before anything else touches them: checkpointing closes the
+    # last connection to the index, and SQLite drops -wal/-shm itself when it does. They
+    # are gone by the end of this call either way, which is what the report states.
+    cleared = [sidecar.name for sidecar in sidecar_paths(db_path) if sidecar.exists()]
+
     rescue_copy: Path | None = None
     if db.database_exists(db_path):
+        _checkpoint_for_rescue(db_path)
         rescue_dir = db_path.parent / RESCUE_DIRNAME
         rescue_dir.mkdir(parents=True, exist_ok=True)
         stamp = _utcnow(now).strftime(SNAPSHOT_TS_FORMAT)
         rescue_copy = _claim_rescue_path(rescue_dir, db_path, stamp)
-        shutil.copy2(db_path, rescue_copy)
+        try:
+            shutil.copy2(db_path, rescue_copy)
+        except OSError as exc:
+            _discard(rescue_copy)  # a half-written bank is worse than none
+            raise SnapshotError(
+                f"could not bank a rescue copy of {db_path} in {rescue_dir}: {exc} - "
+                "nothing has been restored and the live index is intact"
+            ) from exc
 
-    cleared: list[str] = []
-    for sidecar in sidecar_paths(db_path):
-        if sidecar.exists():
-            sidecar.unlink()
-            cleared.append(sidecar.name)
-    db_path.unlink(missing_ok=True)
+    # Still ahead of the teardown: a sidecar the OS refuses to unlink (Windows holds a
+    # lock for any open reader) must read as an error, not a raw traceback.
+    try:
+        for sidecar in sidecar_paths(db_path):
+            sidecar.unlink(missing_ok=True)
+        db_path.unlink(missing_ok=True)
+    except OSError as exc:
+        if rescue_copy is not None:
+            _discard(rescue_copy)  # the live index is intact; its bank is only clutter
+            rescue_copy = None
+        raise SnapshotError(
+            f"refusing to restore over {db_path}: the old index could not be cleared "
+            f"({exc}) - nothing has been restored and the live index is intact"
+        ) from exc
 
     # Past this point the live index is gone, so every failure is reported as a
     # SnapshotError naming the rescue copy - the user's undo - instead of a raw traceback.

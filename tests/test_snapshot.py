@@ -234,6 +234,54 @@ def test_rescue_copy_keeps_committed_rows_still_in_the_wal(tmp_path):
         conn.close()
     assert kept == 1, "rescue copy lost a committed row that lived only in the -wal"
 
+def test_restore_refuses_while_another_reader_holds_the_index(tmp_path):
+    """A held index cannot be banked faithfully, so restore stops before touching anything.
+
+    The write-ahead log cannot be folded in while someone else is reading (routine on
+    Windows: a second `fc` run, a DB browser, a sync client), so the rescue copy would be
+    incomplete - and the sidecar teardown would die on the lock with a raw traceback.
+    """
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+
+    reader = db.connect(dbp)  # a second process's connection, in miniature
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM document").fetchone()  # pins an older snapshot
+    _insert_document(dbp, "b" * 64)  # ... which the checkpoint now cannot fold in
+    try:
+        with pytest.raises(snapshot.SnapshotError) as excinfo:
+            snapshot.restore_snapshot(dbp, target, now=NOW)
+    finally:
+        reader.close()
+
+    message = str(excinfo.value)
+    assert "write-ahead log could not be folded into" in message
+    assert "nothing has been restored" in message
+    conn = db.connect(dbp)  # the index still holds both rows, the snapshot's and the later one
+    assert conn.execute("SELECT COUNT(*) AS n FROM document").fetchone()["n"] == 2
+    conn.close()
+    assert not (dbp.parent / snapshot.RESCUE_DIRNAME).exists(), "no stray rescue copy"
+
+
+def test_restore_over_a_corrupt_live_index_still_runs(tmp_path):
+    """Restoring over an unreadable index is a main reason to restore - it must work.
+
+    There is no recoverable write-ahead log behind a corrupt file, so the bank is the
+    bytes as they stand: still the user's undo, still better than nothing.
+    """
+    dbp = _migrated_db(tmp_path / "data" / "fc.db")
+    _insert_document(dbp, "a" * 64)
+    target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)
+    corrupt = b"not a database at all" * 64
+    dbp.write_bytes(corrupt)
+
+    result = snapshot.restore_snapshot(dbp, target, now=NOW)
+
+    assert result["row_counts"]["document"] == 1
+    assert Path(result["rescue_copy"]).read_bytes() == corrupt
+
+
 def test_restore_without_live_db_records_no_rescue_copy(tmp_path):
     dbp = _migrated_db(tmp_path / "fc.db")
     target = snapshot.create_snapshot(dbp, tmp_path / "snaps", now=NOW)

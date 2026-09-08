@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from filingcabinet import cli
+from filingcabinet import cli, db
 
 
 def test_migrate_refuses_to_create_without_flag(tmp_path):
@@ -190,6 +190,35 @@ def test_restore_invalid_snapshot_exits_two(tmp_path, capsys):
     assert cli.main(["--db", str(dbp), "restore", str(bad)]) == 2
     assert "error:" in capsys.readouterr().err
     assert dbp.read_bytes() == before
+
+
+def test_restore_with_the_index_held_open_exits_two(tmp_path, capsys):
+    """A held index is a routine Windows state; it must report, not raise a traceback."""
+    snaps = tmp_path / "snaps"
+    dbp = tmp_path / "fc.db"
+    assert cli.main(["--db", str(dbp), "migrate", "--create"]) == 0
+    assert cli.main(["--db", str(dbp), "--snapshot-dir", str(snaps), "snapshot"]) == 0
+
+    reader = db.connect(dbp)  # stands in for a second `fc` run or a DB browser
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM document").fetchone()  # pins an older snapshot
+    conn = db.connect(dbp)
+    with conn:
+        conn.execute(
+            "INSERT INTO document (sha256, size_bytes, first_seen_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("c" * 64, 64, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+        )
+    conn.close()
+    capsys.readouterr()
+    try:
+        argv = ["--db", str(dbp), "--snapshot-dir", str(snaps), "restore", "latest"]
+        assert cli.main(argv) == 2
+    finally:
+        reader.close()
+
+    assert "error:" in capsys.readouterr().err
+    assert not (tmp_path / "rescue").exists()
 
 
 def test_restore_from_the_live_db_path_exits_two_and_keeps_the_index(tmp_path, capsys):
