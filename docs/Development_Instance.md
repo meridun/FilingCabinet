@@ -86,6 +86,31 @@ not create the shim (Windows). Add `--json` if the schedule feeds a log parser.
 document. Reorganization stays behind `propose` / `apply`
 ([Architecture.md](Architecture.md) §6).
 
+## Writing taxonomy rules
+
+`propose` (`docs/Architecture.md` §6) classifies against `taxonomy.toml`, which lives beside
+`config.toml` in your instance directory by default (`[paths].taxonomy`, or `--taxonomy` /
+`FC_TAXONOMY` to point elsewhere) — never in the framework repo. `instance init` scaffolds a
+starting file; `filingcabinet/templates/taxonomy.example.toml` in the framework repo documents
+the format with synthetic vendors.
+
+- **Matching order.** Rules run in `(priority descending, id ascending)` order; the first match
+  wins. A document no rule matches is `unclassified` in the plan and waits for an agent verdict.
+- **Recording a verdict:** `filingcabinet classify --document <id> --party P --doc-type T
+  [--detail D] [--doc-date YYYY-MM-DD] [--folder F] [--tag T ...]`. This persists one row per
+  document (`classification` table, `provenance='agent'`) and **outranks** a competing rule on
+  the next `propose`.
+- **Promoting a verdict into a rule.** `classify` prints a paste-ready `[[rules]]` stanza in its
+  output. Paste it into `taxonomy.toml` yourself and adjust `all`/`any`/`none`/`regex` as needed
+  — `classify` never edits the rules file; that is your call, the same posture as `apply` never
+  moving a file unasked.
+- **A missing or empty `taxonomy.toml` is not an error** — every document just routes to the
+  agent. `propose`'s text and `--json` output report the exact file path it read and its rule
+  count, so an all-unclassified run because the wrong file was read is never silent.
+- Rule text is matched case-insensitively against whitespace-normalized OCR text; a party's
+  `aliases` widen the `any` terms of every rule naming that party. Keep `regex` patterns small —
+  matching is capped at the first 200k characters of a document's text.
+
 ## Privacy rules
 
 - Never grant an agent, script, or third-party app broad Drive or account access; scope every
