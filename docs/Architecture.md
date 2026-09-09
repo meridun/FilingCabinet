@@ -234,4 +234,6 @@ as ingest and dedup.
 - Windows OCR toolchain (tesseract) install remains manual (`doctor` reports presence/version,
   landed in phase 4; an installer or `doctor --fix` is still open). See
   [Development.md](Development.md).
-- graphify over OCR text exports for cross-document entity linking. Experiment after phase 4.
+- graphify over OCR text exports for cross-document entity linking: **answered, no-go**
+  (provisional, synthetic corpus) — see
+  [Development_GraphifyExperiment.md](Development_GraphifyExperiment.md).
