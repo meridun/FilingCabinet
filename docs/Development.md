@@ -15,7 +15,12 @@ filingcabinet status
 `fc` is an alias for `filingcabinet`. Every verb accepts `--json`, `--db`, and `--config`;
 `FC_DB` and `FC_CONFIG` environment variables override `config.toml`. Verbs: `migrate`,
 `status`, `ingest`, `dupes`, `ocr run`, `ocr submit`, `find`, `doctor`, `propose`, `classify`,
-`snapshot`, `restore` (`docs/Architecture.md` §5-6, §8).
+`apply`, `undo`, `snapshot`, `restore` (`docs/Architecture.md` §5-6, §8).
+
+`apply <plan>` and `undo <plan_id>` are the only verbs that write to the document tree; both take
+`--root` (overrides `FC_ROOT` / config) and `--dry-run` (report, write nothing). `apply` refuses a
+plan built for a different root or an out-of-date `plan_version` rather than guess — re-run
+`propose` in either case.
 
 A relative `[paths]` value in `config.toml` (`root`, `data_dir`, `snapshot_dir`, `taxonomy`,
 `plan_dir`) resolves against **the config file's directory**, not the shell's working directory;

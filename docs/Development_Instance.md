@@ -111,6 +111,25 @@ the format with synthetic vendors.
   `aliases` widen the `any` terms of every rule naming that party. Keep `regex` patterns small —
   matching is capped at the first 200k characters of a document's text.
 
+## Applying and undoing a plan
+
+`apply <plan>` (`docs/Architecture.md` §6) is the one command that renames files in your document
+root, and the plan file it reads is the only thing that steers it — review a plan before applying
+it, the same as reviewing a diff before merging. Skipped entries (a file that changed since
+`propose`, a locked file, a stale `plan_version`) are reported, not silently dropped; re-run
+`propose` and `apply` the fresh plan for anything skipped.
+
+- **Dry-run first:** `filingcabinet apply plan-<...>.json --dry-run` reports every move it would
+  make without touching the tree or the index.
+- **Undo by plan, not by move:** `filingcabinet undo <plan_id>` reverses every un-undone move that
+  plan made. Pass `--root` explicitly if you ever run `undo` from an instance directory other than
+  the one that produced the plan — `undo` re-resolves the log's relative paths against whatever
+  root the run points at, and the log itself does not record which root a plan was built for, so
+  pointing `undo` at the wrong instance's root can reverse-move a same-named file in that tree.
+- A move is logged (`move_log`, written before the file is touched) before it happens, so an
+  interrupted `apply` never leaves an unlogged, hence unreversible, move — the next `ingest`
+  reconciles anything left inconsistent.
+
 ## Privacy rules
 
 - Never grant an agent, script, or third-party app broad Drive or account access; scope every

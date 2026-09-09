@@ -161,9 +161,37 @@ and writes nothing to `document` — `doc_date`/`party`/`doc_type`/`detail` stay
 `apply` commits an approved plan. The only index write in this phase is the explicit `classify`
 verdict.
 
-`apply <plan>` (phase 6) executes an approved plan against `target_path`, writes `move_log`, and
-checks mtime stability and file locks first so it never fights the sync client mid-write.
-`undo <plan_id>` reverses from the log.
+> **Single write path.** `filingcabinet/apply.py` is the only module in the package permitted to
+> rename a file under `[paths].root` — `organize.py`'s `propose` contract ("nothing here renames,
+> moves, or opens a file under the root for writing") stays literally true. `apply` acts only on
+> an explicit plan file passed on the command line; it never calls `organize.build_plan` and never
+> re-derives or re-runs `propose` itself. The plan file is treated as **untrusted, human-editable
+> input**, not a trusted artifact of its own `propose` run: containment (`target_path` and
+> `current_path` both `is_relative_to(root.resolve())`) is re-checked immediately before every
+> write rather than trusted from the plan, the rendered name is never re-derived from `fields`,
+> and the plan's own `root` must match the root this run resolves from flags/env/config — a plan
+> file cannot retarget the tool at another tree.
+
+`apply <plan>` (phase 6) executes an approved plan against `target_path`: per entry it re-stats
+`current_path` and compares `(mtime, size)` against the pair recorded **into the plan itself**
+(`PLAN_VERSION` 2) — not re-read from `occurrence`, because an `ingest` run between `propose` and
+`apply` would otherwise refresh the index and silently mask a file that changed underneath the
+plan. A stability mismatch or a locked/unopenable file (the sync client mid-write) is skipped and
+named in the run's report, never fatal to the rest of the batch; `apply` refuses a plan built
+under an older `plan_version` outright ("re-run propose") rather than guess at its shape.
+
+> **Write-ahead move-log.** Per move, the `move_log` row is committed *before* the irreversible
+> rename — unlogged means unreversible, which the invariant below forbids. If the rename itself
+> then fails, the row is deleted (an in-process failure leaves no orphan); a crash between the two
+> leaves a row `undo` reports as "target no longer on disk" and skips, reconciled by the next
+> `ingest`. `apply` is also the one place `doc_date` / `party` / `doc_type` / `detail` are
+> committed to `document` from the plan's `fields` — `propose` never writes them.
+
+`undo <plan_id>` reverses every un-undone `move_log` row for that plan back to `from_path`, with
+the same stability/lock checks before each reverse move; a row already undone, or whose
+`to_path` no longer matches the tree, is skipped and reported rather than erroring the batch.
+Both verbs are `--dry-run`-able (report, write nothing — no move, no `move_log` row, no
+`occurrence` update) and neither ever acts without an explicit plan file / `plan_id` argument.
 
 The date in a filename is the date the document pertains to, extracted from OCR text (ISO,
 `D Month YYYY`, `Month D, YYYY`, or numeric — `[taxonomy].date_order`, default `dmy`, breaks a
