@@ -41,6 +41,13 @@ aliases = ["acme mutual insurance", "acme mutual plc"]
 # regex    - optional, case-insensitive, searched (not anchored); keep it small
 # folder   - relative to [paths].root; absolute or ".."-bearing folders are rejected
 # priority - higher wins
+# date_regex - optional, case-insensitive, searched, with exactly ONE capture group holding the
+#              date this rule means. Use it when a document carries several dates and the one
+#              you file by is not the first: a statement's period end, an invoice's due date.
+# date     - optional fallback when date_regex is absent or finds nothing: "first" (default) or
+#            "last" parseable date in the text.
+# A rule with neither key keeps the first-date-in-the-document behaviour, so adding these keys
+# to one rule never changes what any other rule does.
 [[rules]]
 id = "northwind-invoice"
 party = "northwind"
@@ -53,12 +60,19 @@ folder = "Suppliers/Northwind"
 tags = ["supplier"]
 priority = 100
 
+# A statement front page usually carries an issue date and both ends of the statement period.
+# `date_regex` captures the period *end* - the date a human would file this by - and `date` is
+# the fallback if a particular scan has no period line to capture.
 [[rules]]
 id = "northwind-statement"
 party = "northwind"
 doc_type = "statement"
 all = ["northwind"]
 any = ["statement of account", "monthly statement"]
+# A TOML literal string (single quotes), so backslashes are the regex's, not TOML's. The
+# capture is a short window after "to"; the date parser finds the date inside it.
+date_regex = 'statement period.{0,60}?\bto\b\s*([^\r\n]{0,30})'
+date = "last"
 folder = "Suppliers/Northwind"
 tags = ["supplier"]
 priority = 90

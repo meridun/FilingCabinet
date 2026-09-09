@@ -52,6 +52,10 @@ def test_absent_mapping_is_an_empty_taxonomy():
         (_with_rule(folder="/etc"), "folder"),
         (_with_rule(folder="../../outside"), "folder"),
         (_with_rule(folder="C:/Windows"), "folder"),
+        (_with_rule(date="middle"), "date"),
+        (_with_rule(date_regex=r"(20\d\d"), "date_regex"),
+        (_with_rule(date_regex="statement period"), "capture group"),
+        (_with_rule(date_regex=r"(20\d\d)-(\d\d)"), "capture group"),
         ({**GOOD, "date_order": "ymd"}, "date_order"),
         ({**GOOD, "version": "one"}, "version"),
     ],
@@ -132,6 +136,82 @@ def test_match_document_on_empty_text_is_none():
 )
 def test_extract_date(text, order, expected):
     assert taxonomy.extract_date(text, date_order=order) == expected
+
+
+# --- per-rule date selection (#19) -------------------------------------------------------
+
+# One statement-shaped fixture carrying three dates: an issue date first, then both ends of
+# the statement period. First-date-wins lands on the issue date; a human files by the period
+# end. Synthetic - no real party or account number ever enters this repo (Architecture §8).
+MIXED_DATES = (
+    "Statement issued 12 March 2026. Statement period 1 February 2026 to 28 February 2026."
+)
+
+
+def _rule(**overrides):
+    return taxonomy.Taxonomy.from_mapping(_with_rule(**overrides)).rules[0]
+
+
+def test_date_regex_selects_the_captured_date_over_an_earlier_one():
+    rule = _rule(date_regex=r"\bto\s+([^.]{0,30})")
+    assert taxonomy.extract_date_for_rule(rule, MIXED_DATES, date_order="dmy") == (
+        "2026-02-28",
+        "rule-regex",
+    )
+
+
+def test_date_selector_last_first_and_absent():
+    for rule, expected in (
+        (_rule(date="last"), ("2026-02-28", "last")),
+        (_rule(date="first"), ("2026-03-12", "first")),
+        (_rule(), ("2026-03-12", "first")),  # neither key: today's behaviour, unchanged
+        (None, ("2026-03-12", "first")),  # and no rule at all is the same
+    ):
+        assert taxonomy.extract_date_for_rule(rule, MIXED_DATES, date_order="dmy") == expected
+    assert taxonomy.extract_date(MIXED_DATES) == "2026-03-12"
+    assert taxonomy.extract_date(MIXED_DATES, select="last") == "2026-02-28"
+
+
+@pytest.mark.parametrize(
+    "date_regex",
+    [
+        r"period ending ([^.]{0,20})",  # matches nothing
+        r"Statement (issued)",  # matches, but the capture is not a date
+    ],
+)
+@pytest.mark.parametrize(
+    "select, expected", [("first", "2026-03-12"), ("last", "2026-02-28")]
+)
+def test_an_unusable_date_regex_falls_back_to_the_selector(date_regex, select, expected):
+    rule = _rule(date_regex=date_regex, date=select)
+    assert taxonomy.extract_date_for_rule(rule, MIXED_DATES, date_order="dmy") == (
+        expected,
+        select,  # the source says `first`/`last`, never `rule-regex`, when the regex misses
+    )
+
+
+def test_no_parseable_date_anywhere_has_no_source():
+    rule = _rule(date_regex=r"\bto\s+([^.]{0,30})", date="last")
+    assert taxonomy.extract_date_for_rule(rule, "nothing dated here", date_order="dmy") == (
+        None,
+        None,
+    )
+    assert taxonomy.extract_date_for_rule(rule, None, date_order="dmy") == (None, None)
+
+
+def test_match_document_carries_the_matched_rule_without_changing_its_shape():
+    tax = taxonomy.Taxonomy.from_mapping(_with_rule(date="last"))
+    hit = taxonomy.match_document(tax, "northwind invoice")
+    assert hit._rule is tax.rules[0] and hit._rule.date_select == "last"
+    # `_rule` is excluded from equality: the public shape of a Match is unchanged.
+    assert hit == taxonomy.Match(
+        rule_id=hit.rule_id,
+        party=hit.party,
+        doc_type=hit.doc_type,
+        detail=hit.detail,
+        folder=hit.folder,
+        tags=hit.tags,
+    )
 
 
 def test_load_taxonomy_missing_file_is_empty_not_an_error(tmp_path):
