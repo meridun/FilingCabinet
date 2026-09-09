@@ -202,9 +202,28 @@ def _insert(conn, spec: tuple[str, str, str, str, str], ordinal: int, now: str) 
     return document_id
 
 
+def refuse_existing_database(target: Path) -> Path:
+    """Refuse a ``--db`` that already holds a database.
+
+    ``db.connect`` creates-or-opens (filingcabinet/db.py), so without this gate a real index
+    passed here would be migrated and seeded with fabricated rows - an unasked, un-undoable
+    mutation of someone's cabinet (docs/Architecture.md §6). The generator only ever writes a
+    database it created itself, and this is what makes that true. Like the in-repo refusal,
+    there is no override flag on purpose: create a fresh path instead.
+    """
+    if db.database_exists(target):
+        print(
+            f"error: refusing to seed fabricated documents into the existing database at "
+            f"{target} - name a path that does not exist yet (docs/Architecture.md §6)",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return target
+
+
 def build(db_path: Path, *, documents: int = 15) -> dict:
     """Create and populate a migrated demo index at ``db_path``; returns a summary dict."""
-    resolved = refuse_inside_repo(db_path)
+    resolved = refuse_existing_database(refuse_inside_repo(db_path))
     conn = db.connect(resolved)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:

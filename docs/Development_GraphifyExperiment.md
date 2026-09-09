@@ -43,6 +43,10 @@ scan's own filename never leaks into a name, and the graphify run itself was exe
 working directory set to the temp directory, so `graphify-out/` (which contains text-derived node
 summaries) was never created inside the repo.
 
+The generator carries the matching `docs/Architecture.md` §6 guard: it refuses a `--db` that
+already holds a database, so a real index can never be migrated and seeded with fabricated rows
+by a mistyped path in the block below. Neither refusal has an override flag.
+
 ## How to reproduce
 
 `fc.exe` is not installed on Windows; use `python -m filingcabinet` (matches `SMOKE_CMD` in
@@ -51,7 +55,7 @@ than the installed package.
 
 ```bash
 TMP=$TEMP/fc-graphify-8            # any directory outside this repo
-python scripts/make_demo_corpus.py --db $TMP/demo.db
+python scripts/make_demo_corpus.py --db $TMP/demo.db   # refuses a --db that already exists
 python scripts/export_ocr_text.py --db $TMP/demo.db --out $TMP/export
 cd $TMP                            # never the repo: graphify writes graphify-out/ under the cwd
 # then the /graphify skill pipeline over $TMP/export (detect -> extract -> cluster -> report)
@@ -96,7 +100,7 @@ Cross-document links found (entity classes only; every value below is fabricated
 
 ## FTS5 comparison
 
-Same corpus, same 6 queries. `fc find` counts are documents returned; the graphify column is what
+Same corpus, same 7 queries. `fc find` counts are documents returned; the graphify column is what
 `query` / `path` / `explain` returned.
 
 | Query | `fc find` | graphify | Verdict |

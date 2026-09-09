@@ -74,6 +74,23 @@ def test_demo_corpus_refuses_db_inside_the_repo():
     assert not target.exists()
 
 
+def test_demo_corpus_refuses_an_existing_database(tmp_path):
+    """A real index passed as --db must come back byte-identical (docs/Architecture.md §6)."""
+    target = tmp_path / "real.db"
+    conn = db.connect(target)
+    try:
+        db.migrate(conn)
+    finally:
+        conn.close()
+    before = target.read_bytes()
+
+    with pytest.raises(SystemExit) as excinfo:
+        make_demo_corpus.build(target)
+
+    assert excinfo.value.code == 2
+    assert target.read_bytes() == before
+
+
 # Verify gate for the phase-8 spike: docs/Development_GraphifyExperiment.md's "FTS5 comparison"
 # table is the evidence behind its no-go verdict, so the `fc find` column is pinned here rather
 # than left to a hand-run. The last row is the writeup's central claim - the one question class
