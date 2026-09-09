@@ -72,3 +72,31 @@ def test_demo_corpus_refuses_db_inside_the_repo():
 
     assert excinfo.value.code == 2
     assert not target.exists()
+
+
+# Verify gate for the phase-8 spike: docs/Development_GraphifyExperiment.md's "FTS5 comparison"
+# table is the evidence behind its no-go verdict, so the `fc find` column is pinned here rather
+# than left to a hand-run. The last row is the writeup's central claim - the one question class
+# FTS5 cannot express is the transitive join (bank and utility share an account, but no single
+# document names both), so it must return zero.
+WRITEUP_FIND_COUNTS = {
+    "Alex Marlowe": 4,
+    "ACCT-88213604": 3,
+    "Cedarpoint Clinic": 3,
+    "Harborline AND Cedarpoint": 1,
+    "Marlowe AND Ramanathan": 0,
+    "Zephyr Bicycle Repair": 1,
+    "Meridian Bank AND Northwind": 0,
+}
+
+
+def test_demo_corpus_reproduces_the_writeup_comparison_counts(tmp_path):
+    make_demo_corpus.build(tmp_path / "demo.db")
+
+    conn = db.connect(tmp_path / "demo.db")
+    try:
+        actual = {query: len(search.find(conn, query)) for query in WRITEUP_FIND_COUNTS}
+    finally:
+        conn.close()
+
+    assert actual == WRITEUP_FIND_COUNTS
