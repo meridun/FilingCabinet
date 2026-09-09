@@ -127,7 +127,9 @@ document, and `propose` refuses to start if the configured or `--out` path would
 root. The plan is `{plan_version, plan_id, created_at, root, taxonomy, template, summary,
 entries[]}`. Each entry carries, per document: `current_path`, `target_path`, `folder`,
 `target_name`, `fields` (the raw classification values — `party`, `doc_type`, `detail`,
-`doc_date`), `tags`, `provenance` (`rule` or `agent`), `rule_id`, and `status` — `move` (rename
+`doc_date`), `tags`, `provenance` (`rule` or `agent`), `rule_id`, `date_source` (`agent`,
+`rule-regex`, `first`, `last`, or `null` for an unclassified entry — where `doc_date` came from,
+so a wrong date is diagnosable from the plan alone), and `status` — `move` (rename
 and/or folder change), `noop` (target equals current path), `unclassified`, `collision` (two
 documents render the same target, or the target already exists and isn't this document's own
 path — never auto-suffixed; a human resolves it), or `error` (e.g. a folder that would resolve
@@ -169,6 +171,26 @@ The date in a filename is the date the document pertains to, extracted from OCR 
 `D Month YYYY`, `Month D, YYYY`, or numeric — `[taxonomy].date_order`, default `dmy`, breaks a
 numeric ambiguity; an invalid calendar date such as `31/02/2026` yields no date rather than a
 guess). Scan date stays in the index.
+
+**Per-rule date selection.** A document's front page often carries several dates, and the one a
+document is filed by is not always the first one on the page — a bank statement, for example,
+usually shows an issue date plus both ends of the statement period. A `[[rules]]` entry can name
+which date it means: an optional `date_regex` (case-insensitive, searched, exactly one capture
+group) captures the date directly; an optional `date = "first" | "last"` selects among every
+parseable date in the text when no regex is given, or as the fallback when the regex is absent or
+finds nothing parseable. A rule with neither key keeps the original first-date-in-the-document
+behaviour, so adding these keys to one rule never changes what any other rule does. Precedence is
+**agent verdict › `date_regex` › `date` selector › first-date default** — an explicit `classify`
+verdict always outranks a rule. The winning source is recorded per entry as `date_source` (above),
+never silently. **Security-relevant:** a `date_regex` capture is only ever *parsed*, never
+interpolated — it is handed to the same calendar parser as every other date source, so `doc_date`
+is structurally either `None` or an `_iso`-validated `YYYY-MM-DD`; an operator regex cannot smuggle
+path separators or other characters into a proposed name through this route, and `sanitize_component`
+still runs on every rendered field regardless. `date_regex` shares `regex`'s trust posture — it is
+operator-authored config compiled once at load and run over a length-capped window — so keep it
+small, and note that it is deliberately single-line scoped (`.` does not cross a newline): a
+period line an OCR pass breaks mid-way falls through to a `date = "last"` companion instead of
+matching garbage, which is why the shipped example rule ships both keys together.
 
 **Config-relative path resolution.** A relative value under `[paths]` in `config.toml` (`root`,
 `data_dir`, `snapshot_dir`, `taxonomy`, `plan_dir`) resolves against **the config file's own
