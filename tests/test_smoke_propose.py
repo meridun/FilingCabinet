@@ -19,7 +19,7 @@ import sys
 
 import pytest
 
-from filingcabinet import ocr
+from filingcabinet import ocr, organize
 
 requires_pymupdf = pytest.mark.skipif(
     ocr.pymupdf_version() is None, reason="optional `ocr` extra (PyMuPDF)"
@@ -150,7 +150,8 @@ def test_propose_smoke_end_to_end(tmp_path):
     assert str(plan_path) == first["plan"]
     assert plan_dir.exists() and not (root / "plans").exists()
     written = json.loads(plan_path.read_text(encoding="utf-8"))
-    assert written["plan_version"] == 1 and len(written["entries"]) == 2
+    assert written["plan_version"] == organize.PLAN_VERSION
+    assert len(written["entries"]) == 2
 
     # No file under the root was created, renamed, or rewritten.
     assert _tree_fingerprint(root) == fingerprint

@@ -42,7 +42,7 @@ from .taxonomy import (
     match_document,
 )
 
-PLAN_VERSION = 1
+PLAN_VERSION = 2
 DEFAULT_TEMPLATE = "{doc_date}_{party}_{doc_type}_{detail}"
 
 # Per-component cap; keeps total path length sane on the Windows host.
@@ -64,13 +64,19 @@ _RESERVED = frozenset(
     | {f"lpt{n}" for n in range(1, 10)}
 )
 
+# The occurrence join carries three columns off one row - path plus the (mtime, size) pair
+# `apply` (phase 6) compares against before it touches the file - so the stability baseline is
+# recorded *into the plan* rather than re-read from the index at apply time: an `ingest` run
+# between `propose` and `apply` refreshes the occurrence row, so an index-side comparison would
+# silently pass for a file that did change. MIN(occurrence_id) picks the same first live
+# occurrence the scalar subquery used to.
 _PLAN_SQL = """
     SELECT d.document_id AS document_id,
            d.sha256      AS sha256,
            d.ocr_text    AS ocr_text,
-           (SELECT o.rel_path FROM occurrence o
-             WHERE o.document_id = d.document_id AND o.missing_since IS NULL
-             ORDER BY o.occurrence_id LIMIT 1) AS rel_path,
+           o.rel_path    AS rel_path,
+           o.mtime       AS occ_mtime,
+           o.size_bytes  AS occ_size,
            c.party       AS agent_party,
            c.doc_type    AS agent_doc_type,
            c.detail      AS agent_detail,
@@ -80,6 +86,9 @@ _PLAN_SQL = """
            c.provenance  AS agent_provenance
     FROM document d
     LEFT JOIN classification c ON c.document_id = d.document_id
+    LEFT JOIN occurrence o ON o.occurrence_id = (
+        SELECT MIN(o2.occurrence_id) FROM occurrence o2
+         WHERE o2.document_id = d.document_id AND o2.missing_since IS NULL)
     WHERE EXISTS (SELECT 1 FROM occurrence o
                    WHERE o.document_id = d.document_id AND o.missing_since IS NULL)
 """
@@ -99,6 +108,10 @@ class PlanEntry:
     rule_id: str | None = None
     status: str = STATUS_UNCLASSIFIED
     note: str | None = None
+    # The stability baseline `apply` re-checks before it moves the file (docs/Architecture.md §6):
+    # the same (mtime, size) pair `ingest.upsert_file` records on the occurrence row.
+    current_mtime: float | None = None
+    current_size: int | None = None
 
     def as_dict(self) -> dict:
         data = asdict(self)
@@ -123,6 +136,18 @@ class PlanSummary:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _optional(row: Mapping, key: str):
+    """``row[key]`` when the mapping has it, else ``None``.
+
+    Tolerates a row that lacks the key entirely: ``sqlite3.Row`` raises ``IndexError`` and a
+    hand-built dict row (what :func:`plan_document`'s unit tests pass) raises ``KeyError``.
+    """
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
 
 
 def new_plan_id() -> str:
@@ -258,6 +283,8 @@ def plan_document(
         sha256=row["sha256"],
         current_path=current_path,
         fields={name: None for name in TEMPLATE_FIELDS},
+        current_mtime=_optional(row, "occ_mtime"),
+        current_size=_optional(row, "occ_size"),
     )
 
     verdict = _stored_verdict(row) or _rule_verdict(taxonomy, row["ocr_text"])

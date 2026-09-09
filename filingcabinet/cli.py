@@ -1,7 +1,7 @@
 """`filingcabinet` (alias `fc`) command-line entry point.
 
-Verbs: migrate, status, ingest, ocr, find, propose, classify, doctor, dupes, snapshot,
-restore, instance.
+Verbs: migrate, status, ingest, ocr, find, propose, classify, apply, undo, doctor, dupes,
+snapshot, restore, instance.
 
 DB path resolution: --db flag > FC_DB env var > config.toml [paths].data_dir + /filingcabinet.db.
 Config path resolution: --config flag > FC_CONFIG env var > ./config.toml.
@@ -21,6 +21,7 @@ from pathlib import Path
 
 from . import (
     __version__,
+    apply as apply_mod,
     db,
     dedup as dedup_mod,
     ingest as ingest_mod,
@@ -588,6 +589,95 @@ def cmd_classify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _plan_root_matches(plan: dict, root: Path) -> bool:
+    """The plan's own root must be the root this run resolved.
+
+    A plan file is human-editable input; without this a plan could retarget the tool at another
+    tree (docs/Architecture.md section 6).
+    """
+    declared = plan.get("root")
+    if not isinstance(declared, str) or not declared.strip():
+        return False
+    try:
+        return Path(declared).resolve() == root.resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _emit_apply(args: argparse.Namespace, db_path: Path, root: Path, verb: str,
+                outcomes: list, summary) -> None:
+    """Shared reporting for `apply` and `undo`: counts, then one line per non-happy outcome."""
+    payload = {
+        "db": str(db_path),
+        "root": str(root),
+        **summary.as_dict(),
+        "entries": [outcome.as_dict() for outcome in outcomes],
+    }
+    happy = apply_mod.STATUS_MOVED if verb == "apply" else apply_mod.STATUS_REVERSED
+    counts = (
+        f"{summary.moved} moved" if verb == "apply" else f"{summary.reversed} reversed"
+    )
+    header = (
+        f"{root}: plan {summary.plan_id} - {summary.entries} entr(ies), {counts}, "
+        f"{summary.skipped} skipped, {summary.ignored} ignored, {summary.errors} error(s)"
+        + (" (--dry-run: nothing written)" if summary.dry_run else "")
+    )
+    detail = [
+        f"  {outcome.status} {outcome.from_path}: {outcome.reason}"
+        for outcome in outcomes
+        if outcome.status != happy or outcome.reason
+    ]
+    if not outcomes and verb == "undo":
+        detail = ["  nothing left to reverse"]
+    _emit(args, payload, "\n".join([header, *detail]))
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    """Execute an approved plan file - the only verb that renames a document.
+
+    Acts solely on the plan named on the command line: it never re-runs `propose` and never
+    moves a file the plan did not list (docs/Architecture.md section 6). A skipped entry is a
+    report, not a failure - the exit code stays 0, `doctor`'s rule - and only an unusable plan
+    or an unusable database exits non-zero.
+    """
+    db_path = _require_database(args)
+    root = resolve_root(args)
+    plan = apply_mod.read_plan(args.plan)
+    if not _plan_root_matches(plan, root):
+        raise apply_mod.PlanError(
+            f"plan {args.plan} was built for root {plan.get('root')}, but this run resolves "
+            f"{root} - a plan may not retarget the tool at another tree"
+        )
+    conn = db.connect(db_path)
+    try:
+        outcomes, summary = apply_mod.apply_plan(
+            conn, plan, root=root, dry_run=bool(args.dry_run)
+        )
+    finally:
+        conn.close()
+    _emit_apply(args, db_path, root, "apply", outcomes, summary)
+    return 0
+
+
+def cmd_undo(args: argparse.Namespace) -> int:
+    """Reverse every un-undone move of one plan from the move log.
+
+    Per `plan_id`, never partial and never implicit: `undo` on an already-undone plan reports
+    that there is nothing left to reverse and exits 0.
+    """
+    db_path = _require_database(args)
+    root = resolve_root(args)
+    conn = db.connect(db_path)
+    try:
+        outcomes, summary = apply_mod.undo_plan(
+            conn, args.plan_id, root=root, dry_run=bool(args.dry_run)
+        )
+    finally:
+        conn.close()
+    _emit_apply(args, db_path, root, "undo", outcomes, summary)
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report the OCR toolchain. Absence is a report, not a failure: always exits 0."""
     tesseract = ocr_mod.tesseract_version()
@@ -710,6 +800,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", help="why the agent decided this")
     p.set_defaults(func=cmd_classify)
 
+    p = sub.add_parser("apply", help="execute an approved plan: move files, write the move log")
+    p.add_argument("plan", help="the plan file `propose` wrote (required: never applies "
+                                "anything implicitly)")
+    p.add_argument("--root", help="document root (overrides FC_ROOT and config)")
+    p.add_argument("--dry-run", action="store_true", help="report what would move, move nothing")
+    p.set_defaults(func=cmd_apply)
+
+    p = sub.add_parser("undo", help="reverse every un-undone move of one plan from the move log")
+    p.add_argument("plan_id", help="the plan_id to reverse (required)")
+    p.add_argument("--root", help="document root (overrides FC_ROOT and config)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report what would reverse, move nothing")
+    p.set_defaults(func=cmd_undo)
+
     p = sub.add_parser("doctor", help="report the OCR toolchain (tesseract, PyMuPDF)")
     p.set_defaults(func=cmd_doctor)
 
@@ -749,6 +853,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except (
+        apply_mod.PlanError,
         db.NotMigratedError,
         snapshot_mod.SnapshotError,
         taxonomy_mod.TaxonomyError,
