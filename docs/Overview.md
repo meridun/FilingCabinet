@@ -30,7 +30,7 @@ the logic on every request.
 | Apply plans, move-log, undo | Architecture.md § Organize | 6 |
 | MCP wrapper (agent surface) | Architecture.md § Agent surface | 7 |
 | Snapshot + restore of the index | Architecture.md § Snapshot and restore | - |
-| graphify experiment (cross-document entity linking) | Architecture.md § Open questions | 8 |
+| graphify experiment (cross-document entity linking) | [Development_GraphifyExperiment.md](Development_GraphifyExperiment.md) | 8 |
 
 Local setup, commands, and the branch model: [Development.md](Development.md). Shared repo
 config adopted from model-repo: the `## Shared config` table in the [README](../README.md).
