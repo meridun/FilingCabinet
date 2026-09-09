@@ -14,6 +14,7 @@ where it is absent. The migration and the plan-directory guard always run.
 
 import hashlib
 import json
+import pathlib
 import subprocess
 import sys
 
@@ -176,3 +177,138 @@ def test_propose_smoke_end_to_end(tmp_path):
     assert len(list(plan_dir.glob("*.json"))) == 2  # the dry run added nothing
 
     assert _tree_fingerprint(root) == fingerprint  # still byte-identical after every step
+
+
+# --- issue #19: per-rule doc_date selection ------------------------------------------------
+#
+# The gating real run for `date_regex` / `date = "first" | "last"`: the same subprocess CLI
+# walk as above, over a statement whose front page carries three dates (an issue date, a
+# period start, a period end) the way a real statement does. Unit tests cover the selectors in
+# isolation; this proves the selected date reaches the *proposed name* and that the plan file
+# records where it came from.
+
+STATEMENT_LINES = (
+    "Northwind Supplies monthly statement of account.",
+    "Issue date 02/01/2026.",
+    "Statement period 05/01/2026 to 04/02/2026.",
+    "Balance carried forward from the previous statement of account.",
+    "Printed 09/03/2026 for the account holder's records.",
+)
+
+STATEMENT_TAXONOMY = """
+version = 1
+doc_types = ["statement"]
+date_order = "dmy"
+
+[parties.northwind]
+display = "Northwind Supplies"
+aliases = ["northwind supplies"]
+
+[[rules]]
+id = "northwind-statement"
+party = "northwind"
+doc_type = "statement"
+all = ["northwind"]
+any = ["statement of account"]
+folder = "Suppliers/Northwind"
+tags = ["supplier"]
+priority = 90
+"""
+
+# The shipped scaffold's worked example, verbatim: a TOML literal string whose capture is a
+# short window after "to", left for the date parser to resolve.
+PERIOD_END_REGEX = r"date_regex = 'statement period.{0,60}?\bto\b\s*([^\r\n]{0,30})'" + "\n"
+MISSING_REGEX = r"date_regex = 'no such phrase here (\d{4})'" + "\n"
+
+
+@requires_pymupdf
+def test_propose_smoke_per_rule_doc_date_selection(tmp_path):
+    """Each date selector, end to end: the chosen date lands in the proposed name."""
+    db = tmp_path / "fc.db"
+    root = tmp_path / "root"
+    (root / "inbox").mkdir(parents=True)
+    _write_pdf(root / "inbox" / "scan-101.pdf", list(STATEMENT_LINES))
+    taxonomy = tmp_path / "taxonomy.toml"
+    plan_dir = tmp_path / "plans"  # outside the root, as always
+
+    assert _run(db, "migrate", "--create")["created"] is True
+    assert _run(db, "ingest", "--root", str(root))["new"] == 1
+    assert _run(db, "ocr", "run", "--root", str(root))["errors"] == 0
+    fingerprint = _tree_fingerprint(root)
+
+    def propose(rule_keys):
+        taxonomy.write_text(STATEMENT_TAXONOMY + rule_keys, encoding="utf-8")
+        out = _run(db, "propose", "--root", str(root), "--taxonomy", str(taxonomy),
+                   "--plan-dir", str(plan_dir))
+        entry = out["entries"][0]
+        written = json.loads(pathlib.Path(out["plan"]).read_text(encoding="utf-8"))
+        # The plan file carries what the JSON output claims - the plan is what phase 6 reads.
+        assert written["entries"][0]["date_source"] == entry["date_source"]
+        assert written["plan_version"] == 1
+        return entry
+
+    def name(entry):
+        return entry["target_path"].rsplit("/", 1)[-1]
+
+    # Neither key: unchanged first-date behaviour - the issue date, the first date in the text.
+    plain = propose("")
+    assert name(plain) == "2026-01-02_Northwind_Supplies_statement.pdf"
+    assert plain["date_source"] == "first"
+
+    # date_regex names the period end, beating both the earlier issue date and the last date.
+    regexed = propose(PERIOD_END_REGEX)
+    assert name(regexed) == "2026-02-04_Northwind_Supplies_statement.pdf"
+    assert regexed["date_source"] == "rule-regex"
+
+    # The selector on its own: "last" is the printed-on date at the foot, "first" is today's.
+    last = propose('date = "last"\n')
+    assert name(last) == "2026-03-09_Northwind_Supplies_statement.pdf"
+    assert last["date_source"] == "last"
+    assert name(propose('date = "first"\n')) == name(plain)
+
+    # A regex that finds nothing degrades to the selector rather than erroring or blanking.
+    fallen_back = propose(MISSING_REGEX + 'date = "last"\n')
+    assert name(fallen_back) == name(last)
+    assert fallen_back["date_source"] == "last"
+
+    # The agent verdict still outranks every rule-side selection.
+    _run(db, "classify", "--document", str(plain["document_id"]),
+         "--party", "Northwind Supplies", "--doc-type", "statement",
+         "--doc-date", "2026-06-30", "--folder", "Suppliers/Northwind")
+    agent = propose(PERIOD_END_REGEX)
+    assert name(agent) == "2026-06-30_Northwind_Supplies_statement.pdf"
+    assert agent["date_source"] == "agent"
+
+    # Choosing a different date is still a *proposal*: nothing under the root moved or changed.
+    assert _tree_fingerprint(root) == fingerprint
+    assert not (root / "plans").exists()
+
+
+@pytest.mark.parametrize(
+    "date_keys, fragment",
+    [
+        ('date = "middle"\n', "rules.northwind-statement.date must be one of first, last"),
+        (r"date_regex = '(20\d\d'" + "\n", "rules.northwind-statement.date_regex:"),
+        (r"date_regex = 'period to \d+'" + "\n", "must have exactly one capture group"),
+        (r"date_regex = '(period) to (\d+)'" + "\n", "must have exactly one capture group"),
+    ],
+)
+def test_propose_smoke_rejects_bad_date_keys_at_load(tmp_path, date_keys, fragment):
+    """Bad date keys fail at load, before any document is touched - no toolchain needed."""
+    db = tmp_path / "fc.db"
+    root = tmp_path / "root"
+    root.mkdir()
+    taxonomy = tmp_path / "taxonomy.toml"
+    taxonomy.write_text(STATEMENT_TAXONOMY + date_keys, encoding="utf-8")
+    assert _run(db, "migrate", "--create")["created"] is True
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "filingcabinet.cli", "--db", str(db), "propose",
+         "--root", str(root), "--taxonomy", str(taxonomy),
+         "--plan-dir", str(tmp_path / "plans")],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert fragment in proc.stderr
+    assert not (tmp_path / "plans").exists()
