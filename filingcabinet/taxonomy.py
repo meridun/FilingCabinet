@@ -37,6 +37,8 @@ PROVENANCE_AGENT = "agent"
 
 DEFAULT_DATE_ORDER = "dmy"
 _DATE_ORDERS = ("dmy", "mdy")
+# Per-rule fallback selector when no `date_regex` is given, or when it finds nothing.
+_DATE_SELECTORS = ("first", "last")
 
 _MONTHS = {
     "january": 1, "jan": 1,
@@ -94,7 +96,12 @@ class Rule:
     none_terms: tuple[str, ...] = ()
     regex: str | None = None
     priority: int = 0
+    # Which date in the document this rule means. `date_regex` captures it outright; the
+    # `date` TOML key (here `date_select`, to avoid shadowing) is the fallback selector.
+    date_regex: str | None = None
+    date_select: str | None = None
     _pattern: re.Pattern[str] | None = field(default=None, compare=False, repr=False)
+    _date_pattern: re.Pattern[str] | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -106,6 +113,9 @@ class Match:
     folder: str | None = None
     tags: tuple[str, ...] = ()
     provenance: str = PROVENANCE_RULE
+    # The rule that produced this match, for callers that need its date keys. Excluded from
+    # equality and repr, so `Match`'s public shape is unchanged.
+    _rule: "Rule | None" = field(default=None, compare=False, repr=False)
 
 
 def _require_mapping(value, where: str) -> dict:
@@ -239,6 +249,28 @@ class Taxonomy:
                 except re.error as exc:
                     raise TaxonomyError(f"{where}.regex: {exc}") from exc
 
+            date_select = _optional_string(raw.get("date"), f"{where}.date")
+            if date_select is not None:
+                date_select = date_select.lower()
+                if date_select not in _DATE_SELECTORS:
+                    raise TaxonomyError(
+                        f"{where}.date must be one of {', '.join(_DATE_SELECTORS)}"
+                    )
+
+            date_regex = _optional_string(raw.get("date_regex"), f"{where}.date_regex")
+            date_pattern = None
+            if date_regex is not None:
+                try:
+                    date_pattern = re.compile(date_regex, re.IGNORECASE)
+                except re.error as exc:
+                    raise TaxonomyError(f"{where}.date_regex: {exc}") from exc
+                # Exactly one group: the captured text is what the date parser is handed, so
+                # "which group did you mean" must never be a runtime question.
+                if date_pattern.groups != 1:
+                    raise TaxonomyError(
+                        f"{where}.date_regex must have exactly one capture group"
+                    )
+
             priority = raw.get("priority", 0)
             if not isinstance(priority, int) or isinstance(priority, bool):
                 raise TaxonomyError(f"{where}.priority must be an integer")
@@ -263,7 +295,10 @@ class Taxonomy:
                     none_terms=_string_list(raw.get("none"), f"{where}.none"),
                     regex=regex,
                     priority=priority,
+                    date_regex=date_regex,
+                    date_select=date_select,
                     _pattern=pattern,
+                    _date_pattern=date_pattern,
                 )
             )
 
@@ -328,6 +363,7 @@ def match_document(taxonomy: Taxonomy, text: str | None) -> Match | None:
                 folder=rule.folder,
                 tags=rule.tags,
                 provenance=PROVENANCE_RULE,
+                _rule=rule,
             )
     return None
 
@@ -340,17 +376,29 @@ def _iso(year: int, month: int, day: int) -> str | None:
         return None
 
 
-def extract_date(text: str | None, *, date_order: str = DEFAULT_DATE_ORDER) -> str | None:
-    """First parseable date in ``text``, normalized to ISO ``YYYY-MM-DD``.
+def _date_window(text: str) -> str:
+    """The one normalized, length-capped slice every date scan runs over."""
+    return unicodedata.normalize("NFKC", text)[:MAX_MATCH_CHARS]
 
-    Ambiguity is resolved by the document, then by config: a numeric date whose first field is
-    greater than 12 is unambiguous and resolves itself; otherwise ``date_order`` decides.
-    Returns ``None`` rather than guessing when nothing parses.
+
+def _numeric_iso(first: int, second: int, year: int, date_order: str) -> str | None:
+    """Resolve a numeric date: the document decides when it can, else ``date_order``."""
+    if first > 12:  # unambiguous: only a day can exceed 12
+        day, month = first, second
+    elif second > 12:
+        day, month = second, first
+    elif date_order == "mdy":
+        day, month = second, first
+    else:
+        day, month = first, second
+    return _iso(year, month, day)
+
+
+def _first_date(window: str, date_order: str) -> str | None:
+    """Today's first-date behaviour, verbatim: the first *pattern class* that yields a valid
+    calendar date wins - ISO, then D-Month-Y, then Month-D-Y, then numeric. Deliberately not
+    positional: a document that mixes formats must keep resolving the way it always has.
     """
-    if not text:
-        return None
-    window = unicodedata.normalize("NFKC", text)[:MAX_MATCH_CHARS]
-
     match = _ISO_RE.search(window)
     if match:
         iso = _iso(int(match[1]), int(match[2]), int(match[3]))
@@ -367,16 +415,97 @@ def extract_date(text: str | None, *, date_order: str = DEFAULT_DATE_ORDER) -> s
 
     match = _NUMERIC_RE.search(window)
     if match:
-        first, second, year = int(match[1]), int(match[2]), int(match[3])
-        if first > 12:  # unambiguous: only a day can exceed 12
-            day, month = first, second
-        elif second > 12:
-            day, month = second, first
-        elif date_order == "mdy":
-            day, month = second, first
-        else:
-            day, month = first, second
-        iso = _iso(year, month, day)
+        iso = _numeric_iso(int(match[1]), int(match[2]), int(match[3]), date_order)
         if iso:
             return iso
     return None
+
+
+def _scan_dates(window: str, date_order: str) -> list[tuple[int, str]]:
+    """Every parseable date in ``window`` as ``(start offset, ISO)``, positional order.
+
+    Unlike :func:`_first_date` this is positional across all four pattern classes, because
+    "the last date in the document" is a question about position. Sorted by offset and then by
+    match length, so the tie-break at one offset is the longest (most specific) match.
+    """
+    found: list[tuple[int, int, str]] = []
+
+    for match in _ISO_RE.finditer(window):
+        iso = _iso(int(match[1]), int(match[2]), int(match[3]))
+        if iso:
+            found.append((match.start(), match.end() - match.start(), iso))
+
+    for pattern, order in ((_DMY_TEXT_RE, "dmy"), (_MDY_TEXT_RE, "mdy")):
+        for match in pattern.finditer(window):
+            day, month_name = (match[1], match[2]) if order == "dmy" else (match[2], match[1])
+            iso = _iso(int(match[3]), _MONTHS[month_name.casefold()], int(day))
+            if iso:
+                found.append((match.start(), match.end() - match.start(), iso))
+
+    for match in _NUMERIC_RE.finditer(window):
+        iso = _numeric_iso(int(match[1]), int(match[2]), int(match[3]), date_order)
+        if iso:
+            found.append((match.start(), match.end() - match.start(), iso))
+
+    found.sort(key=lambda hit: (hit[0], hit[1]))
+    return [(start, iso) for start, _length, iso in found]
+
+
+def _last_date(window: str, date_order: str) -> str | None:
+    dates = _scan_dates(window, date_order)
+    return dates[-1][1] if dates else None
+
+
+def extract_date(
+    text: str | None,
+    *,
+    date_order: str = DEFAULT_DATE_ORDER,
+    select: str = "first",
+) -> str | None:
+    """A date from ``text``, normalized to ISO ``YYYY-MM-DD``.
+
+    ``select="first"`` (the default, and what every caller got before per-rule selection
+    existed) takes the first parseable date; ``select="last"`` takes the last one, which is how
+    a statement's period-end date is reached when no ``date_regex`` names it.
+
+    Ambiguity is resolved by the document, then by config: a numeric date whose first field is
+    greater than 12 is unambiguous and resolves itself; otherwise ``date_order`` decides.
+    Returns ``None`` rather than guessing when nothing parses.
+    """
+    if not text:
+        return None
+    window = _date_window(text)
+    if select == "last":
+        return _last_date(window, date_order)
+    return _first_date(window, date_order)
+
+
+def extract_date_for_rule(
+    rule: Rule | None,
+    text: str | None,
+    *,
+    date_order: str = DEFAULT_DATE_ORDER,
+) -> tuple[str | None, str | None]:
+    """The date a *rule* means, plus where it came from: ``(ISO date, date_source)``.
+
+    ``date_source`` is ``"rule-regex"``, ``"first"``, ``"last"``, or ``None`` when nothing
+    parsed - recorded on the plan entry so a wrong date is diagnosable from the plan alone.
+    Precedence: ``date_regex`` first, then the ``date`` selector as its fallback (a regex that
+    matches nothing, or captures something unparseable, is not an error - it degrades). A rule
+    with neither key, and no rule at all, are both today's first-date behaviour exactly.
+    """
+    if not text:
+        return (None, None)
+    window = _date_window(text)
+
+    if rule is not None and rule._date_pattern is not None:
+        for match in rule._date_pattern.finditer(window):
+            captured = match[1]
+            # Parsed by exactly the parser that scanned the window, over the capture alone.
+            iso = _first_date(captured, date_order) if captured else None
+            if iso:
+                return (iso, "rule-regex")
+
+    select = (rule.date_select if rule is not None else None) or "first"
+    iso = _last_date(window, date_order) if select == "last" else _first_date(window, date_order)
+    return (iso, select) if iso else (None, None)

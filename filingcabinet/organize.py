@@ -38,7 +38,7 @@ from .taxonomy import (
     PROVENANCE_RULE,
     Taxonomy,
     TaxonomyError,
-    extract_date,
+    extract_date_for_rule,
     match_document,
 )
 
@@ -106,6 +106,9 @@ class PlanEntry:
     tags: tuple[str, ...] = ()
     provenance: str | None = None
     rule_id: str | None = None
+    # Which selector produced `fields["doc_date"]`: rule-regex | first | last | agent, or None
+    # when no date was found. Makes a wrong date diagnosable from the plan alone.
+    date_source: str | None = None
     status: str = STATUS_UNCLASSIFIED
     note: str | None = None
     # The stability baseline `apply` re-checks before it moves the file (docs/Architecture.md §6):
@@ -248,6 +251,7 @@ def _stored_verdict(row: Mapping) -> dict | None:
         "tags": _tags_from_json(row["agent_tags"]),
         "provenance": PROVENANCE_AGENT,
         "rule_id": None,
+        "rule": None,  # an agent verdict has no rule, so no per-rule date keys
     }
 
 
@@ -264,6 +268,7 @@ def _rule_verdict(taxonomy: Taxonomy, text: str | None) -> dict | None:
         "tags": hit.tags,
         "provenance": PROVENANCE_RULE,
         "rule_id": hit.rule_id,
+        "rule": hit._rule,  # carried for its date_regex / date keys, not re-looked-up by id
     }
 
 
@@ -291,9 +296,13 @@ def plan_document(
     if verdict is None:
         return base
 
-    doc_date = verdict["doc_date"] or extract_date(
-        row["ocr_text"], date_order=taxonomy.date_order
-    )
+    # Precedence: the agent verdict's explicit date, then the matched rule's own selection.
+    if verdict["doc_date"]:
+        doc_date, date_source = verdict["doc_date"], PROVENANCE_AGENT
+    else:
+        doc_date, date_source = extract_date_for_rule(
+            verdict["rule"], row["ocr_text"], date_order=taxonomy.date_order
+        )
     fields = {
         "doc_date": doc_date,
         "party": verdict["party"],
@@ -305,6 +314,7 @@ def plan_document(
         "tags": tuple(verdict["tags"]),
         "provenance": verdict["provenance"],
         "rule_id": verdict["rule_id"],
+        "date_source": date_source,
     }
 
     def failed(note: str) -> PlanEntry:

@@ -154,12 +154,68 @@ def test_build_plan_uses_a_date_from_the_text(tmp_path):
     entries, _ = build(conn, tmp_path)
     assert entries[0].fields["doc_date"] == "2026-02-03"
     assert entries[0].target_name == "2026-02-03_Northwind_invoice.pdf"
+    assert entries[0].date_source == "first"  # a rule with no date keys is first-date-wins
+
+
+# A statement front page as OCR'd: an issue date, then both ends of the statement period. The
+# date a human files by is the period end, which is neither the first nor the only date here.
+STATEMENT_TEXT = (
+    "Northwind statement of account. Issued 12 March 2026. "
+    "Statement period 1 February 2026 to 28 February 2026."
+)
+STATEMENT_TAXONOMY = {
+    **TAXONOMY,
+    "rules": [
+        {
+            "id": "northwind-statement",
+            "party": "northwind",
+            "doc_type": "statement",
+            "all": ["northwind"],
+            "any": ["statement of account"],
+            "date_regex": r"\bto\s+([^.]{0,30})",
+            "folder": "Suppliers/Northwind",
+            "priority": 100,
+        }
+    ],
+}
+
+
+def test_a_rule_date_regex_picks_the_statement_period_end(tmp_path):
+    """AC 4's in-repo substitute for re-running the pilot: the period end, not the first date."""
+    conn = _migrated()
+    _add_document(conn, "scan.pdf", STATEMENT_TEXT)
+    entries, _ = build(conn, tmp_path, taxonomy=_tax(STATEMENT_TAXONOMY))
+    entry = entries[0]
+    assert entry.fields["doc_date"] == "2026-02-28" and entry.date_source == "rule-regex"
+    assert entry.target_name == "2026-02-28_Northwind_statement.pdf"
+
+
+def test_a_rule_date_selector_picks_the_last_date(tmp_path):
+    conn = _migrated()
+    _add_document(conn, "scan.pdf", STATEMENT_TEXT)
+    rule = {**STATEMENT_TAXONOMY["rules"][0], "date": "last"}
+    del rule["date_regex"]
+    entries, _ = build(conn, tmp_path, taxonomy=_tax({**TAXONOMY, "rules": [rule]}))
+    assert entries[0].fields["doc_date"] == "2026-02-28"
+    assert entries[0].date_source == "last"
+
+
+def test_an_agent_date_outranks_the_rules_date_regex(tmp_path):
+    conn = _migrated()
+    document_id = _add_document(conn, "scan.pdf", STATEMENT_TEXT)
+    organize.record_agent_classification(
+        conn, document_id, party="Northwind", doc_type="statement", doc_date="2026-01-31"
+    )
+    entries, _ = build(conn, tmp_path, taxonomy=_tax(STATEMENT_TAXONOMY))
+    assert entries[0].fields["doc_date"] == "2026-01-31"
+    assert entries[0].date_source == "agent"
 
 
 def test_build_plan_leaves_an_unmatched_document_unclassified(tmp_path):
     conn = _migrated()
     _add_document(conn, "mystery.pdf", "nothing recognisable here")
     entries, summary = build(conn, tmp_path)
+    assert entries[0].date_source is None  # unclassified: no selector ever ran
     assert entries[0].status == organize.STATUS_UNCLASSIFIED
     assert entries[0].provenance is None and entries[0].target_path is None
     assert summary.unclassified == 1 and summary.move == 0
@@ -294,7 +350,7 @@ def test_write_plan_round_trips(tmp_path):
     assert payload["summary"]["documents"] == 1
     assert list(payload["entries"][0]) == [
         "document_id", "sha256", "current_path", "target_path", "folder", "target_name",
-        "fields", "tags", "provenance", "rule_id", "status", "note",
+        "fields", "tags", "provenance", "rule_id", "date_source", "status", "note",
         "current_mtime", "current_size",
     ]
     assert not list(target.parent.glob("*.tmp"))  # atomic write leaves no scratch behind
