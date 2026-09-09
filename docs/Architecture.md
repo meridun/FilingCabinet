@@ -234,9 +234,35 @@ against.
 
 ## 7. Agent surface (phase 7)
 
-Every CLI verb takes `--json`. A thin MCP server wraps the verbs as typed tools: `ingest`,
-`status`, `find`, `dupes`, `propose`, `apply`, `undo`. The engine and CLI need none of the MCP
-dependency; `pip install filingcabinet[mcp]` adds it.
+Every CLI verb takes `--json`. `filingcabinet/mcp_server.py` is a thin MCP server wrapping seven
+of them as typed tools:
+
+| Tool | CLI verb | Mode |
+|---|---|---|
+| `status` | `status` | read |
+| `find` | `find` | read |
+| `dupes` | `dupes report` | read |
+| `ingest` | `ingest` | write (index only) |
+| `propose` | `propose` | write (a plan file, never a document) |
+| `apply` | `apply` | write |
+| `undo` | `undo` | write |
+
+Each tool's parameters mirror that verb's flags (plus `db` / `config`), and the result is the
+verb's `--json` payload verbatim: the wrapper builds the argv it would have typed, parses it with
+the CLI's own parser, dispatches in-process with stdout captured, and returns the parsed JSON.
+Config and DB resolution are therefore identical to the CLI's, flag for flag - there is no
+business logic in the wrapper and no subprocess. An expected failure (missing database, unusable
+plan, bad taxonomy) surfaces as an MCP tool error carrying the CLI's own message.
+
+The wrapper adds **no** mutation path of its own (section 6): `apply` requires the path of a plan
+file that already exists and `undo` a `plan_id`, both forwarded verbatim - there is no combined
+propose-then-apply tool and no default plan discovery, so an agent must name a plan a human can
+read first. `classify`, `dupes label`, `ocr`, `migrate`, `snapshot`/`restore`, `doctor` and
+`instance init` stay CLI-only.
+
+Run it over stdio with `filingcabinet-mcp` (or `python -m filingcabinet.mcp_server`). The engine
+and CLI need none of the MCP dependency - only the server entry point imports it, lazily;
+`pip install filingcabinet[mcp]` adds it.
 
 ## 8. Snapshot and restore (index only)
 
