@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from filingcabinet import cli, db, dedup, ocr
+from filingcabinet import cli, db, dedup, ocr, organize
 
 
 def test_migrate_refuses_to_create_without_flag(tmp_path):
@@ -563,7 +563,9 @@ def test_propose_json_shape_and_plan_file(tmp_path, monkeypatch, capsys):
     assert entry["target_path"] == "Suppliers/Northwind/2026-02-03_Northwind_invoice.pdf"
     assert out["move"] == 1 and out["rule_matched"] == 1
     written = json.loads(Path(out["plan"]).read_text(encoding="utf-8"))
-    assert written["plan_version"] == 1 and written["plan_id"] == out["plan_id"]
+    assert written["plan_version"] == organize.PLAN_VERSION
+    assert written["plan_id"] == out["plan_id"]
+    assert {"current_mtime", "current_size"} <= set(written["entries"][0])
 
 
 def test_propose_exits_zero_on_an_all_unclassified_corpus(tmp_path, monkeypatch, capsys):
@@ -793,3 +795,90 @@ def test_classify_rejects_an_unknown_document(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         cli.main(["--db", dbp, "classify", "--document", "9999", "--party", "Acme"])
     assert "no document" in str(exc.value)
+
+
+# --- apply / undo (phase 6) ---------------------------------------------------------------
+
+
+def _planned(tmp_path, monkeypatch, capsys):
+    """Propose over the phase-5 fixture and return (db, root, plan path, plan_id)."""
+    dbp, root, tax = _propose_fixture(tmp_path, monkeypatch)
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "--json", "propose", "--root", str(root),
+                     "--taxonomy", str(tax), "--plan-dir", str(tmp_path / "plans")]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["move"] == 1
+    return dbp, root, Path(out["plan"]), out["plan_id"]
+
+
+def test_apply_json_shape_and_exit_zero(tmp_path, monkeypatch, capsys):
+    dbp, root, plan, plan_id = _planned(tmp_path, monkeypatch, capsys)
+    assert cli.main(["--db", dbp, "--json", "apply", str(plan), "--root", str(root)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert {"db", "root", "plan_id", "entries", "moved", "reversed", "skipped", "ignored",
+            "errors", "dry_run"} <= set(out)
+    assert out["plan_id"] == plan_id and out["moved"] == 1 and out["errors"] == 0
+    moved = out["entries"][0]
+    assert moved["status"] == "moved" and moved["to_path"].startswith("Suppliers/Northwind/")
+    assert (root / moved["to_path"]).is_file() and not (root / "scan.pdf").exists()
+
+
+def test_apply_dry_run_moves_nothing(tmp_path, monkeypatch, capsys):
+    dbp, root, plan, _ = _planned(tmp_path, monkeypatch, capsys)
+    assert cli.main(["--db", dbp, "--json", "apply", str(plan), "--root", str(root),
+                     "--dry-run"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["dry_run"] is True and out["moved"] == 1
+    assert (root / "scan.pdf").is_file() and not (root / "Suppliers").exists()
+
+
+def test_undo_json_shape_and_second_undo_is_a_noop(tmp_path, monkeypatch, capsys):
+    dbp, root, plan, plan_id = _planned(tmp_path, monkeypatch, capsys)
+    assert cli.main(["--db", dbp, "apply", str(plan), "--root", str(root)]) == 0
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "--json", "undo", plan_id, "--root", str(root)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["reversed"] == 1 and out["plan_id"] == plan_id
+    assert (root / "scan.pdf").is_file()
+    assert cli.main(["--db", dbp, "--json", "undo", plan_id, "--root", str(root)]) == 0
+    again = json.loads(capsys.readouterr().out)
+    assert again["reversed"] == 0 and again["entries"] == []
+
+
+def test_apply_refuses_a_plan_built_for_another_root(tmp_path, monkeypatch, capsys):
+    dbp, root, plan, _ = _planned(tmp_path, monkeypatch, capsys)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    assert cli.main(["--db", dbp, "apply", str(plan), "--root", str(elsewhere)]) == 2
+    assert "may not retarget" in capsys.readouterr().err
+    assert (root / "scan.pdf").is_file()
+
+
+def test_apply_of_an_unusable_plan_exits_two_without_a_traceback(tmp_path, monkeypatch, capsys):
+    dbp, root, plan, _ = _planned(tmp_path, monkeypatch, capsys)
+    plan.write_text("{ not json", encoding="utf-8")
+    assert cli.main(["--db", dbp, "apply", str(plan), "--root", str(root)]) == 2
+    assert "not valid JSON" in capsys.readouterr().err
+
+
+def test_apply_requires_a_migrated_db(tmp_path, monkeypatch, capsys):
+    _, root, plan, _ = _planned(tmp_path, monkeypatch, capsys)
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(tmp_path / "absent.db"), "apply", str(plan), "--root", str(root)])
+
+
+@pytest.mark.parametrize("argv", [["apply"], ["undo"]])
+def test_apply_and_undo_refuse_to_run_without_their_argument(tmp_path, argv):
+    """No implicit 'apply everything pending' - the plan/plan_id positional is required."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--db", str(tmp_path / "fc.db"), *argv])
+    assert exc.value.code == 2
+
+
+def test_undo_text_report_says_nothing_left_to_reverse(tmp_path, monkeypatch, capsys):
+    dbp, root, plan, plan_id = _planned(tmp_path, monkeypatch, capsys)
+    assert cli.main(["--db", dbp, "apply", str(plan), "--root", str(root)]) == 0
+    assert cli.main(["--db", dbp, "undo", plan_id, "--root", str(root)]) == 0
+    capsys.readouterr()
+    assert cli.main(["--db", dbp, "undo", plan_id, "--root", str(root)]) == 0
+    assert "nothing left to reverse" in capsys.readouterr().out
