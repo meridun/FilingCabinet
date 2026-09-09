@@ -29,3 +29,5 @@ process.
   the label taxonomy lives in `sdlc/bindings/gh-issue/labels.md`
 - `Development_Instance.md` — the framework/instance split and `instance init`
 - `Development_TokenTools.md` — vtk/graphify setup notes, if adopted
+- `Development_GraphifyExperiment.md` — phase-8 spike: graphify over OCR text exports vs
+  `fc find`, and the go/no-go it produced

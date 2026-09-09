@@ -351,8 +351,39 @@ def test_write_plan_round_trips(tmp_path):
     assert list(payload["entries"][0]) == [
         "document_id", "sha256", "current_path", "target_path", "folder", "target_name",
         "fields", "tags", "provenance", "rule_id", "date_source", "status", "note",
+        "current_mtime", "current_size",
     ]
     assert not list(target.parent.glob("*.tmp"))  # atomic write leaves no scratch behind
+
+
+def test_build_plan_records_the_stability_baseline_apply_checks(tmp_path):
+    """Every entry carries the occurrence (mtime, size) pair, so `apply` compares against the
+    file as it was when the plan was built rather than against an index `ingest` may have
+    refreshed since."""
+    conn = _migrated()
+    _add_document(conn, "inbox/scan1.pdf", "Northwind tax invoice no 7")
+    conn.execute("UPDATE occurrence SET mtime = 1234.5, size_bytes = 4096")
+    entries, _ = build(conn, tmp_path)
+    assert (entries[0].current_mtime, entries[0].current_size) == (1234.5, 4096)
+
+
+def test_build_plan_records_the_baseline_on_an_unclassified_entry_too(tmp_path):
+    conn = _migrated()
+    _add_document(conn, "inbox/mystery.pdf", "nothing a rule matches")
+    conn.execute("UPDATE occurrence SET mtime = 7.0, size_bytes = 11")
+    entries, _ = build(conn, tmp_path)
+    assert entries[0].status == organize.STATUS_UNCLASSIFIED
+    assert (entries[0].current_mtime, entries[0].current_size) == (7.0, 11)
+
+
+def test_plan_document_tolerates_a_row_without_the_baseline_columns(tmp_path):
+    """`plan_document`'s unit callers pass hand-built dict rows; a missing key is not an error."""
+    row = {"document_id": 1, "sha256": "s", "ocr_text": "Northwind invoice", "rel_path": "a.pdf",
+           "agent_provenance": None}
+    entry = organize.plan_document(
+        row, taxonomy=_tax(), template=organize.DEFAULT_TEMPLATE, root=tmp_path
+    )
+    assert entry.current_mtime is None and entry.current_size is None
 
 
 def test_new_plan_id_shape():
