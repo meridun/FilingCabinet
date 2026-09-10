@@ -202,7 +202,9 @@ accepted formats are ISO, `D Month YYYY`, `Month D, YYYY`, compact `DD-Mon-YYYY`
 the year is widened, so it means the same thing at either year width. A 2-digit year `YY` resolves
 to `20YY` unless that would put the date more than one year in the future, in which case it
 resolves to `19YY` — a future document date is more likely a misread than a real one, so the rule
-leans to the past. An invalid calendar date such as `31/02/2026` yields no date rather than a
+leans to the past. The pivot reads the current year, so it moves with the calendar: the same
+`YY` can resolve to a different century depending on when `propose` runs, not on anything in the
+document. An invalid calendar date such as `31/02/2026` yields no date rather than a
 guess. Selection is **positional**: the first (or, per rule, last) date *on the page* wins,
 whichever format matched it — format order breaks a tie only between two formats matching at the
 same offset, so a garbled month-name date further down cannot outrank a good date on the first
