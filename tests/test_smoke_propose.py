@@ -332,7 +332,7 @@ RECEIPT_LINES = {
     # a four-digit year: the control that must keep parsing exactly as it did before
     "scan-204.pdf": "Northwind Pharmacy receipt - Date Filled: 04/07/2025 - qty 60",
     # positional: the numeric date at offset 0 beats the OCR-garbled month-name date later on
-    "scan-205.pdf": "01/08/2026 Northwind Pharmacy receipt - member since January 2, 1936",
+    "scan-205.pdf": "01/08/2026 Northwind Pharmacy receipt - member since June 5, 1950",
 }
 
 RECEIPT_NAMES = {

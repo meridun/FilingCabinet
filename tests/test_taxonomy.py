@@ -156,10 +156,10 @@ def test_extract_date(text, order, expected):
     assert taxonomy.extract_date(text, date_order=order) == expected
 
 
-# The shape of the defect: OCR turned a footer into "January 2, 1936" on a package whose first
+# The shape of the defect: OCR turned a footer into "June 5, 1950" on a package whose first
 # line reads 01/08/2026, and class-ordered precedence let the month-name date win. Synthetic
 # text in the shape of the reported document; no user document enters this repo (§8).
-_POSITIONAL_TEXT = "01/08/2026 tax package - member since January 2, 1936 - see enclosed"
+_POSITIONAL_TEXT = "01/08/2026 tax package - member since June 5, 1950 - see enclosed"
 
 
 @pytest.mark.parametrize("order, expected", [("dmy", "2026-08-01"), ("mdy", "2026-01-08")])
