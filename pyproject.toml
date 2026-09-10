@@ -20,6 +20,8 @@ mcp = ["mcp>=1.0"]
 [project.scripts]
 filingcabinet = "filingcabinet.cli:main"
 fc = "filingcabinet.cli:main"
+# Phase 7 MCP wrapper (stdio). Needs the optional `mcp` extra; imported lazily.
+filingcabinet-mcp = "filingcabinet.mcp_server:main"
 
 [tool.setuptools]
 packages = ["filingcabinet"]
