@@ -254,6 +254,23 @@ def test_two_documents_rendering_one_name_collide(tmp_path):
     assert summary.collision == 1
 
 
+def test_two_documents_with_two_digit_year_dates_do_not_collide(tmp_path):
+    """The reported failure in miniature (#25): same party and doc type, dates the parser used
+    to miss, so both rendered one name. Synthetic receipt-shaped text - the real corpus is
+    instance-side and no user document enters this repo (Architecture §8), so this is the
+    in-repo proxy for re-running `propose --dry-run` on it."""
+    conn = _migrated()
+    _add_document(conn, "a.pdf", "Northwind invoice 3/8/26 qty 30", sha="sha-a")
+    _add_document(conn, "b.pdf", "Northwind invoice Date Filled: 12/3/25 qty 90", sha="sha-b")
+    entries, summary = build(conn, tmp_path)
+    assert [e.status for e in entries] == [organize.STATUS_MOVE, organize.STATUS_MOVE]
+    assert sorted(e.target_name for e in entries) == [
+        "2025-03-12_Northwind_invoice.pdf",
+        "2026-08-03_Northwind_invoice.pdf",
+    ]
+    assert summary.collision == 0 and summary.move == 2
+
+
 def test_a_target_already_on_disk_collides(tmp_path):
     conn = _migrated()
     _add_document(conn, "a.pdf", "Northwind invoice one")

@@ -195,10 +195,18 @@ the same stability/lock checks before each reverse move; a row already undone, o
 Both verbs are `--dry-run`-able (report, write nothing — no move, no `move_log` row, no
 `occurrence` update) and neither ever acts without an explicit plan file / `plan_id` argument.
 
-The date in a filename is the date the document pertains to, extracted from OCR text (ISO,
-`D Month YYYY`, `Month D, YYYY`, or numeric — `[taxonomy].date_order`, default `dmy`, breaks a
-numeric ambiguity; an invalid calendar date such as `31/02/2026` yields no date rather than a
-guess). Scan date stays in the index.
+The date in a filename is the date the document pertains to, extracted from OCR text. The
+accepted formats are ISO, `D Month YYYY`, `Month D, YYYY`, compact `DD-Mon-YYYY` / `DD-Mon-YY`
+(`29-sep-2025`, separators `-` and `.` only), and numeric `D/M/YYYY` or `D/M/YY`.
+`[taxonomy].date_order` (default `dmy`) breaks a numeric day/month ambiguity, and does so before
+the year is widened, so it means the same thing at either year width. A 2-digit year `YY` resolves
+to `20YY` unless that would put the date more than one year in the future, in which case it
+resolves to `19YY` — a future document date is more likely a misread than a real one, so the rule
+leans to the past. An invalid calendar date such as `31/02/2026` yields no date rather than a
+guess. Selection is **positional**: the first (or, per rule, last) date *on the page* wins,
+whichever format matched it — format order breaks a tie only between two formats matching at the
+same offset, so a garbled month-name date further down cannot outrank a good date on the first
+line. Scan date stays in the index.
 
 **Per-rule date selection.** A document's front page often carries several dates, and the one a
 document is filed by is not always the first one on the page — a bank statement, for example,
@@ -206,8 +214,9 @@ usually shows an issue date plus both ends of the statement period. A `[[rules]]
 which date it means: an optional `date_regex` (case-insensitive, searched, exactly one capture
 group) captures the date directly; an optional `date = "first" | "last"` selects among every
 parseable date in the text when no regex is given, or as the fallback when the regex is absent or
-finds nothing parseable. A rule with neither key keeps the original first-date-in-the-document
-behaviour, so adding these keys to one rule never changes what any other rule does. Precedence is
+finds nothing parseable. A rule with neither key keeps the plain first-date-in-the-document
+behaviour — first by position, per the paragraph above — so adding these keys to one rule never
+changes what any other rule does. Precedence is
 **agent verdict › `date_regex` › `date` selector › first-date default** — an explicit `classify`
 verdict always outranks a rule. The winning source is recorded per entry as `date_source` (above),
 never silently. **Security-relevant:** a `date_regex` capture is only ever *parsed*, never

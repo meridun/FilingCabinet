@@ -56,8 +56,10 @@ _MONTHS = {
 }
 _MONTH_ALTERNATION = "|".join(sorted(_MONTHS, key=len, reverse=True))
 
-# Ordered: the first pattern that yields a *valid* calendar date wins. ISO first because it is
-# unambiguous; the numeric form last because it is the only one that can need `date_order`.
+# Positional: the *first* date on the page wins, whichever class matched it. The declaration
+# order below is kept only as the tie-break between two classes matching at the same offset -
+# ISO first because it is unambiguous, the numeric form last because it is the only one that
+# can need `date_order`. A 2-digit year is resolved by `_expand_two_digit_year`.
 _ISO_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _DMY_TEXT_RE = re.compile(
     rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?({_MONTH_ALTERNATION})\.?,?\s+(\d{{4}})\b",
@@ -67,7 +69,16 @@ _MDY_TEXT_RE = re.compile(
     rf"\b({_MONTH_ALTERNATION})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b",
     re.IGNORECASE,
 )
-_NUMERIC_RE = re.compile(r"\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})\b")
+# `29-sep-2025` / `29.Sep.25`. Its own pattern rather than a widened `_DMY_TEXT_RE`: the
+# space-separated month-name form stays 4-digit-only, because `3 February 26` is more likely a
+# stray box number than a date. Separators `-` and `.` only; the year is mandatory.
+_DMY_COMPACT_RE = re.compile(
+    rf"\b(\d{{1,2}})[-.]({_MONTH_ALTERNATION})\.?[-.](\d{{4}}|\d{{2}})\b",
+    re.IGNORECASE,
+)
+# `(\d{4}|\d{2})`, not `\d{2,4}`: it prefers the 4-digit reading, and with the trailing `\b` it
+# rejects 3- and 5-digit runs instead of truncating them.
+_NUMERIC_RE = re.compile(r"\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{4}|\d{2})\b")
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -381,8 +392,32 @@ def _date_window(text: str) -> str:
     return unicodedata.normalize("NFKC", text)[:MAX_MATCH_CHARS]
 
 
-def _numeric_iso(first: int, second: int, year: int, date_order: str) -> str | None:
-    """Resolve a numeric date: the document decides when it can, else ``date_order``."""
+def _expand_two_digit_year(year_text: str, *, current_year: int | None = None) -> int:
+    """A year *as written* resolved to a full year: ``"2025"`` -> 2025, ``"26"`` -> 2026.
+
+    ``YY`` maps to ``20YY`` when that is not more than one year in the future, else ``19YY``: a
+    document date in the future is more likely a misread than a real date, so the rule leans to
+    the past. This is the module's only clock read; ``current_year`` exists so the pivot is
+    testable without freezing time.
+    """
+    if len(year_text) == 4:
+        return int(year_text)
+    candidate = 2000 + int(year_text)
+    pivot = (current_year if current_year is not None else datetime.now().year) + 1
+    return candidate if candidate <= pivot else candidate - 100
+
+
+def _month_name_iso(day_text: str, month_name: str, year_text: str) -> str | None:
+    """The shared body of the three month-name classes."""
+    return _iso(_expand_two_digit_year(year_text), _MONTHS[month_name.casefold()], int(day_text))
+
+
+def _numeric_iso(first: int, second: int, year_text: str, date_order: str) -> str | None:
+    """Resolve a numeric date: the document decides when it can, else ``date_order``.
+
+    Day/month disambiguation runs *ahead of* year expansion, so ``date_order`` keeps its exact
+    meaning at every year width.
+    """
     if first > 12:  # unambiguous: only a day can exceed 12
         day, month = first, second
     elif second > 12:
@@ -391,64 +426,54 @@ def _numeric_iso(first: int, second: int, year: int, date_order: str) -> str | N
         day, month = second, first
     else:
         day, month = first, second
-    return _iso(year, month, day)
-
-
-def _first_date(window: str, date_order: str) -> str | None:
-    """Today's first-date behaviour, verbatim: the first *pattern class* that yields a valid
-    calendar date wins - ISO, then D-Month-Y, then Month-D-Y, then numeric. Deliberately not
-    positional: a document that mixes formats must keep resolving the way it always has.
-    """
-    match = _ISO_RE.search(window)
-    if match:
-        iso = _iso(int(match[1]), int(match[2]), int(match[3]))
-        if iso:
-            return iso
-
-    for pattern, order in ((_DMY_TEXT_RE, "dmy"), (_MDY_TEXT_RE, "mdy")):
-        match = pattern.search(window)
-        if match:
-            day, month_name = (match[1], match[2]) if order == "dmy" else (match[2], match[1])
-            iso = _iso(int(match[3]), _MONTHS[month_name.casefold()], int(day))
-            if iso:
-                return iso
-
-    match = _NUMERIC_RE.search(window)
-    if match:
-        iso = _numeric_iso(int(match[1]), int(match[2]), int(match[3]), date_order)
-        if iso:
-            return iso
-    return None
+    return _iso(_expand_two_digit_year(year_text), month, day)
 
 
 def _scan_dates(window: str, date_order: str) -> list[tuple[int, str]]:
-    """Every parseable date in ``window`` as ``(start offset, ISO)``, positional order.
+    """Every parseable date in ``window`` as ``(start offset, ISO)``, strictly by position.
 
-    Unlike :func:`_first_date` this is positional across all four pattern classes, because
-    "the last date in the document" is a question about position. Sorted by offset and then by
-    match length, so the tie-break at one offset is the longest (most specific) match.
+    Positional across all five pattern classes, because both "the first date in the document"
+    and "the last" are questions about position. Class order (the declaration order of the
+    regexes) breaks a tie only between two classes matching at the *same* offset, where exactly
+    one hit is kept - so the result is strictly increasing by offset.
     """
     found: list[tuple[int, int, str]] = []
 
     for match in _ISO_RE.finditer(window):
         iso = _iso(int(match[1]), int(match[2]), int(match[3]))
         if iso:
-            found.append((match.start(), match.end() - match.start(), iso))
+            found.append((match.start(), 0, iso))
 
-    for pattern, order in ((_DMY_TEXT_RE, "dmy"), (_MDY_TEXT_RE, "mdy")):
+    month_name_classes = ((_DMY_TEXT_RE, "dmy"), (_MDY_TEXT_RE, "mdy"), (_DMY_COMPACT_RE, "dmy"))
+    for rank, (pattern, order) in enumerate(month_name_classes, start=1):
         for match in pattern.finditer(window):
             day, month_name = (match[1], match[2]) if order == "dmy" else (match[2], match[1])
-            iso = _iso(int(match[3]), _MONTHS[month_name.casefold()], int(day))
+            iso = _month_name_iso(day, month_name, match[3])
             if iso:
-                found.append((match.start(), match.end() - match.start(), iso))
+                found.append((match.start(), rank, iso))
 
     for match in _NUMERIC_RE.finditer(window):
-        iso = _numeric_iso(int(match[1]), int(match[2]), int(match[3]), date_order)
+        iso = _numeric_iso(int(match[1]), int(match[2]), match[3], date_order)
         if iso:
-            found.append((match.start(), match.end() - match.start(), iso))
+            found.append((match.start(), 4, iso))
 
     found.sort(key=lambda hit: (hit[0], hit[1]))
-    return [(start, iso) for start, _length, iso in found]
+    positional: list[tuple[int, str]] = []
+    for start, _rank, iso in found:
+        if positional and positional[-1][0] == start:
+            continue  # one hit per offset: the best-ranked class already took it
+        positional.append((start, iso))
+    return positional
+
+
+def _first_date(window: str, date_order: str) -> str | None:
+    """The first parseable date by *position*, class order breaking only an offset tie.
+
+    The head of the very list :func:`_last_date` takes the tail of, so "first" and "last" are
+    the two ends of one positional scan rather than two implementations kept in sync by hand.
+    """
+    dates = _scan_dates(window, date_order)
+    return dates[0][1] if dates else None
 
 
 def _last_date(window: str, date_order: str) -> str | None:
@@ -468,9 +493,12 @@ def extract_date(
     existed) takes the first parseable date; ``select="last"`` takes the last one, which is how
     a statement's period-end date is reached when no ``date_regex`` names it.
 
-    Ambiguity is resolved by the document, then by config: a numeric date whose first field is
-    greater than 12 is unambiguous and resolves itself; otherwise ``date_order`` decides.
-    Returns ``None`` rather than guessing when nothing parses.
+    Both selectors are positional across every format class, so "first" means the first date on
+    the page and not the first *format* that happens to parse. Ambiguity is resolved by the
+    document, then by config: a numeric date whose first field is greater than 12 is unambiguous
+    and resolves itself; otherwise ``date_order`` decides. A 2-digit year resolves to this
+    century unless that would put the date more than a year in the future, in which case it
+    resolves to the last one. Returns ``None`` rather than guessing when nothing parses.
     """
     if not text:
         return None
@@ -492,7 +520,7 @@ def extract_date_for_rule(
     parsed - recorded on the plan entry so a wrong date is diagnosable from the plan alone.
     Precedence: ``date_regex`` first, then the ``date`` selector as its fallback (a regex that
     matches nothing, or captures something unparseable, is not an error - it degrades). A rule
-    with neither key, and no rule at all, are both today's first-date behaviour exactly.
+    with neither key, and no rule at all, are both the plain first-date-on-the-page behaviour.
     """
     if not text:
         return (None, None)

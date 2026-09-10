@@ -130,12 +130,62 @@ def test_match_document_on_empty_text_is_none():
         ("dated 25/12/2026", "dmy", "2026-12-25"),
         ("dated 25/12/2026", "mdy", "2026-12-25"),  # unambiguous: config cannot override it
         ("dated 31/02/2026", "dmy", None),  # validated through the calendar
+        # 2-digit years and the compact month-name form (#25)
+        ("3/8/26", "dmy", "2026-08-03"),
+        ("3/8/26", "mdy", "2026-03-08"),
+        ("Date Filled: 12/3/25", "dmy", "2025-03-12"),
+        ("Date Filled: 12/3/25", "mdy", "2025-12-03"),
+        # a second field > 12 self-resolves at 2-digit width too: date_order stays a tie-break
+        ("12/22/25", "dmy", "2025-12-22"),
+        ("12/22/25", "mdy", "2025-12-22"),
+        ("01/22/26", "dmy", "2026-01-22"),
+        ("01/22/26", "mdy", "2026-01-22"),
+        ("renewed 29-sep-2025", "dmy", "2025-09-29"),
+        ("renewed 29-sep-2025", "mdy", "2025-09-29"),  # month-name classes ignore date_order
+        ("renewed 29-Sep-25", "dmy", "2025-09-29"),
+        ("renewed 29-Sep-25", "mdy", "2025-09-29"),
+        ("dated 31/02/26", "dmy", None),  # calendar-validated at 2-digit width as well
+        ("built v1.2.26 here", "dmy", None),  # word boundary: a version is not a date
+        ("ref 3/8/265", "dmy", None),  # a 3-digit run is not a year
+        ("renewed 29-sep", "dmy", None),  # the compact form requires a year
         ("no date here at all", "dmy", None),
         ("", "dmy", None),
     ],
 )
 def test_extract_date(text, order, expected):
     assert taxonomy.extract_date(text, date_order=order) == expected
+
+
+# The shape of the defect: OCR turned a footer into "January 2, 1936" on a package whose first
+# line reads 01/08/2026, and class-ordered precedence let the month-name date win. Synthetic
+# text in the shape of the reported document; no user document enters this repo (§8).
+_POSITIONAL_TEXT = "01/08/2026 tax package - member since January 2, 1936 - see enclosed"
+
+
+@pytest.mark.parametrize("order, expected", [("dmy", "2026-08-01"), ("mdy", "2026-01-08")])
+def test_first_date_is_positional(order, expected):
+    assert taxonomy.extract_date(_POSITIONAL_TEXT, date_order=order) == expected
+
+
+def test_first_and_last_are_the_ends_of_one_positional_list():
+    text = _POSITIONAL_TEXT + " printed 2026-03-04"
+    assert taxonomy.extract_date(text, date_order="mdy", select="first") == "2026-01-08"
+    assert taxonomy.extract_date(text, date_order="mdy", select="last") == "2026-03-04"
+
+
+@pytest.mark.parametrize(
+    "year_text, expected",
+    [
+        ("26", 2026),
+        ("27", 2027),  # one year ahead is allowed
+        ("28", 1928),  # further ahead is a misread: lean to the past
+        ("99", 1999),
+        ("2025", 2025),  # a written 4-digit year is never rewritten
+    ],
+)
+def test_two_digit_year_century_pivot(year_text, expected):
+    # `current_year` is passed explicitly: the pivot must never be asserted against the clock.
+    assert taxonomy._expand_two_digit_year(year_text, current_year=2026) == expected
 
 
 # --- per-rule date selection (#19) -------------------------------------------------------
@@ -187,6 +237,17 @@ def test_an_unusable_date_regex_falls_back_to_the_selector(date_regex, select, e
     assert taxonomy.extract_date_for_rule(rule, MIXED_DATES, date_order="dmy") == (
         expected,
         select,  # the source says `first`/`last`, never `rule-regex`, when the regex misses
+    )
+
+
+def test_a_date_regex_capture_with_a_two_digit_year_parses():
+    """A per-rule `date_regex` (#19) parses its capture with the same parser, so widening the
+    parser is what makes a 2-digit year reachable through a rule at all."""
+    rule = _rule(date_regex=r"Date Filled:\s*(\S{6,10})")
+    text = "pharmacy receipt - rx 1234567 - Date Filled: 12/3/25 - qty 30"
+    assert taxonomy.extract_date_for_rule(rule, text, date_order="dmy") == (
+        "2025-03-12",
+        "rule-regex",
     )
 
 
