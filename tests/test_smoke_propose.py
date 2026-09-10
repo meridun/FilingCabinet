@@ -313,3 +313,95 @@ def test_propose_smoke_rejects_bad_date_keys_at_load(tmp_path, date_keys, fragme
     assert proc.returncode != 0
     assert fragment in proc.stderr
     assert not (tmp_path / "plans").exists()
+
+
+# --- issue #25: 2-digit years, DD-Mon-YYYY, positional first date ---------------------------
+#
+# The gating real run for the widened date parser. Five documents of one party and doc type,
+# carrying the formats the parser used to miss: without a `doc_date` every one of them renders
+# the same name and collides, which is the reported failure. Synthetic text in the *shape* of
+# the reported documents - no user document, real party, or corpus file enters this repo
+# (docs/Architecture.md section 8), so re-running the pilot corpus stays an operator check.
+
+RECEIPT_LINES = {
+    # two-digit numeric year, both field orders
+    "scan-201.pdf": "Northwind Pharmacy receipt - Date Filled: 3/8/26 - qty 30",
+    "scan-202.pdf": "Northwind Pharmacy receipt - Date Filled: 12/3/25 - qty 90",
+    # the compact month-name form
+    "scan-203.pdf": "Northwind Pharmacy receipt - issued 29-sep-2025 - renewal",
+    # a four-digit year: the control that must keep parsing exactly as it did before
+    "scan-204.pdf": "Northwind Pharmacy receipt - Date Filled: 04/07/2025 - qty 60",
+    # positional: the numeric date at offset 0 beats the OCR-garbled month-name date later on
+    "scan-205.pdf": "01/08/2026 Northwind Pharmacy receipt - member since January 2, 1936",
+}
+
+RECEIPT_NAMES = {
+    "scan-201.pdf": "2026-08-03_Northwind_Pharmacy_receipt.pdf",
+    "scan-202.pdf": "2025-03-12_Northwind_Pharmacy_receipt.pdf",
+    "scan-203.pdf": "2025-09-29_Northwind_Pharmacy_receipt.pdf",
+    "scan-204.pdf": "2025-07-04_Northwind_Pharmacy_receipt.pdf",
+    "scan-205.pdf": "2026-08-01_Northwind_Pharmacy_receipt.pdf",
+}
+
+RECEIPT_TAXONOMY = """
+version = 1
+doc_types = ["receipt"]
+date_order = "dmy"
+
+[parties.northwind]
+display = "Northwind Pharmacy"
+aliases = ["northwind pharmacy"]
+
+[[rules]]
+id = "northwind-receipt"
+party = "northwind"
+doc_type = "receipt"
+all = ["northwind"]
+any = ["receipt"]
+folder = "Health/Northwind"
+priority = 80
+"""
+
+
+@requires_pymupdf
+def test_propose_smoke_widened_date_formats_do_not_collide(tmp_path):
+    """Every date class reaches the proposed name, so same-party documents stop colliding."""
+    db = tmp_path / "fc.db"
+    root = tmp_path / "root"
+    (root / "inbox").mkdir(parents=True)
+    for name, line in RECEIPT_LINES.items():
+        _write_pdf(root / "inbox" / name, [line])
+    taxonomy = tmp_path / "taxonomy.toml"
+    taxonomy.write_text(RECEIPT_TAXONOMY, encoding="utf-8")
+    plan_dir = tmp_path / "plans"  # outside the root, as always
+
+    assert _run(db, "migrate", "--create")["created"] is True
+    assert _run(db, "ingest", "--root", str(root))["new"] == len(RECEIPT_LINES)
+    assert _run(db, "ocr", "run", "--root", str(root))["errors"] == 0
+    fingerprint = _tree_fingerprint(root)
+
+    out = _run(db, "propose", "--root", str(root), "--taxonomy", str(taxonomy),
+               "--plan-dir", str(plan_dir))
+    by_path = {entry["current_path"]: entry for entry in out["entries"]}
+
+    for name, expected in RECEIPT_NAMES.items():
+        entry = by_path[f"inbox/{name}"]
+        assert entry["status"] == "move", name
+        assert entry["rule_id"] == "northwind-receipt" and entry["provenance"] == "rule"
+        assert entry["target_path"] == f"Health/Northwind/{expected}", name
+        # the date came from the plain first-date-on-the-page path, not a per-rule regex
+        assert entry["date_source"] == "first", name
+        assert entry["fields"]["doc_date"] == expected[:10], name
+
+    # The reported failure, gone: five documents of one party and type, five distinct names.
+    assert (out["collision"], out["move"], out["rule_matched"]) == (0, 5, 5)
+
+    # The plan file carries the same dates the JSON output claims.
+    written = json.loads(pathlib.Path(out["plan"]).read_text(encoding="utf-8"))
+    assert sorted(e["target_path"].rsplit("/", 1)[-1] for e in written["entries"]) == sorted(
+        RECEIPT_NAMES.values()
+    )
+
+    # A better date is still only a *proposal*: nothing under the root moved or changed.
+    assert _tree_fingerprint(root) == fingerprint
+    assert not (root / "plans").exists()
