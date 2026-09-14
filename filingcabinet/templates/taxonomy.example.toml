@@ -46,8 +46,13 @@ aliases = ["acme mutual insurance", "acme mutual plc"]
 #              you file by is not the first: a statement's period end, an invoice's due date.
 # date     - optional fallback when date_regex is absent or finds nothing: "first" (default) or
 #            "last" parseable date in the text.
-# A rule with neither key keeps the first-date-in-the-document behaviour, so adding these keys
-# to one rule never changes what any other rule does.
+# detail   - optional static text for {detail}; the same for every document this rule matches
+# detail_regex - optional, case-insensitive, searched, with exactly ONE capture group holding the
+#              per-document detail. The capture becomes {detail}; keep it small. `detail` is the
+#              fallback when this key is absent or finds nothing. Use it when date + party +
+#              doc_type cannot tell two documents apart on their own.
+# A rule with none of these keys keeps the first-date-in-the-document, static-detail behaviour,
+# so adding them to one rule never changes what any other rule does.
 [[rules]]
 id = "northwind-invoice"
 party = "northwind"
@@ -85,3 +90,18 @@ any = ["policy schedule", "certificate of insurance"]
 folder = "Insurance/Acme Mutual"
 tags = ["insurance"]
 priority = 80
+
+# Two prescriptions filled on the same day share a party, a doc_type, and a date, so
+# {doc_date}_{party}_{doc_type} renders one name for both. The prescription number is on the
+# page: `detail_regex` lifts it into {detail} and the two names separate. A TOML literal string
+# (single quotes), so the backslashes belong to the regex rather than to TOML.
+[[rules]]
+id = "northwind-receipt"
+party = "northwind"
+doc_type = "receipt"
+all = ["northwind"]
+any = ["receipt", "prescription"]
+detail_regex = 'rx\s*#?\s*:?\s*([0-9]{4,12})'
+detail = "prescription"
+folder = "Health/Northwind"
+priority = 70

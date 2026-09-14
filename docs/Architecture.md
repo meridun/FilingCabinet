@@ -129,11 +129,21 @@ entries[]}`. Each entry carries, per document: `current_path`, `target_path`, `f
 `target_name`, `fields` (the raw classification values — `party`, `doc_type`, `detail`,
 `doc_date`), `tags`, `provenance` (`rule` or `agent`), `rule_id`, `date_source` (`agent`,
 `rule-regex`, `first`, `last`, or `null` for an unclassified entry — where `doc_date` came from,
-so a wrong date is diagnosable from the plan alone), and `status` — `move` (rename
-and/or folder change), `noop` (target equals current path), `unclassified`, `collision` (two
-documents render the same target, or the target already exists and isn't this document's own
-path — never auto-suffixed; a human resolves it), or `error` (e.g. a folder that would resolve
-outside the root).
+so a wrong date is diagnosable from the plan alone), `detail_source` (`agent`, `rule-regex`,
+`rule`, or `null` — the same for `detail`), and `status` — `move` (rename
+and/or folder change), `noop` (target equals current path), `unclassified`, `collision` (the
+target already exists on disk and isn't this document's own path, or no suffix could be
+derived), or `error` (e.g. a folder that would resolve outside the root).
+
+Two *in-plan* documents rendering one target is **not** a collision: the first claimer keeps the
+plain name and each later one is retargeted to `<stem>_<sha256[:6]><ext>`, a `move` entry whose
+`note` reads `suffixed: collision with document <id>`, so both documents stay in the plan and
+both are visible to the reviewer. The suffix is content-derived — taken only from the
+index-computed `document.sha256`, never from OCR text, the current filename, or the document id —
+so it is stable across runs; *which* twin keeps the plain name follows the plan's
+`ORDER BY document_id` and can change if a re-ingest renumbers documents, which is acceptable
+because both entries are proposals a human reviews. A document whose `sha256` yields fewer than
+six hex characters keeps the `collision` status rather than taking a junk suffix.
 
 > **Security-critical: `target_path` vs. `fields`.** `entries[].target_path` is the only
 > sanitized, root-verified value in a plan file, and the only one `apply` (phase 6) may act on.
@@ -230,6 +240,23 @@ operator-authored config compiled once at load and run over a length-capped wind
 small, and note that it is deliberately single-line scoped (`.` does not cross a newline): a
 period line an OCR pass breaks mid-way falls through to a `date = "last"` companion instead of
 matching garbage, which is why the shipped example rule ships both keys together.
+
+**Per-rule detail selection.** `{detail}` is the only template field that can tell two documents
+apart once date, party, and doc_type agree — two prescriptions filled the same day, two policy
+documents issued together. A `[[rules]]` entry can carry an optional `detail_regex`
+(case-insensitive, searched, exactly one capture group) whose capture becomes `{detail}` for that
+document; the rule's static `detail` is the fallback when the key is absent or the regex finds
+nothing. Precedence is **agent verdict › `detail_regex` capture › static `detail` › none**, the
+date chain with the static key in the selector's slot, and the winner is recorded per entry as
+`detail_source`. A capture holding no alphanumeric character is refused in favour of the fallback,
+because `sanitize_component` would reduce it to nothing and silently erase the field.
+**Security-relevant:** unlike a `date_regex` capture — which is *parsed* into an `_iso`-validated
+date and so cannot carry arbitrary characters — a `detail_regex` capture is **text** taken
+straight out of OCR content. It is therefore exactly as trusted as a static `detail` or an agent
+`--detail` is today: it lands raw in `fields` (the pre-sanitization record) and
+`sanitize_component` at render time is what keeps separators, `..`, control characters, and
+reserved device names out of `target_path`. Template rendering is tokenized, so a capture
+containing `{party}` cannot be interpreted as a template.
 
 **Config-relative path resolution.** A relative value under `[paths]` in `config.toml` (`root`,
 `data_dir`, `snapshot_dir`, `taxonomy`, `plan_dir`) resolves against **the config file's own

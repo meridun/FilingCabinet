@@ -32,6 +32,12 @@ from pathlib import Path, PurePosixPath
 # regex cannot become unbounded work on a long document.
 MAX_MATCH_CHARS = 200_000
 
+# Cap on the raw `detail_regex` capture that lands in the plan's `fields`. Deliberately its own
+# constant rather than a reuse of `organize.MAX_COMPONENT_CHARS`: that one bounds a *path*
+# component at render time, this one bounds the *plan payload*, and the two concerns are free to
+# diverge without either silently resizing the other.
+MAX_DETAIL_CHARS = 80
+
 PROVENANCE_RULE = "rule"
 PROVENANCE_AGENT = "agent"
 
@@ -111,8 +117,12 @@ class Rule:
     # `date` TOML key (here `date_select`, to avoid shadowing) is the fallback selector.
     date_regex: str | None = None
     date_select: str | None = None
+    # The per-document `{detail}` this rule means. `detail_regex` captures it out of the text;
+    # the static `detail` above is the fallback when it is absent or finds nothing.
+    detail_regex: str | None = None
     _pattern: re.Pattern[str] | None = field(default=None, compare=False, repr=False)
     _date_pattern: re.Pattern[str] | None = field(default=None, compare=False, repr=False)
+    _detail_pattern: re.Pattern[str] | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -282,6 +292,20 @@ class Taxonomy:
                         f"{where}.date_regex must have exactly one capture group"
                     )
 
+            detail_regex = _optional_string(raw.get("detail_regex"), f"{where}.detail_regex")
+            detail_pattern = None
+            if detail_regex is not None:
+                try:
+                    detail_pattern = re.compile(detail_regex, re.IGNORECASE)
+                except re.error as exc:
+                    raise TaxonomyError(f"{where}.detail_regex: {exc}") from exc
+                # Exactly one group, for the same reason `date_regex` insists on it: the capture
+                # becomes `{detail}`, so "which group did you mean" is never a runtime question.
+                if detail_pattern.groups != 1:
+                    raise TaxonomyError(
+                        f"{where}.detail_regex must have exactly one capture group"
+                    )
+
             priority = raw.get("priority", 0)
             if not isinstance(priority, int) or isinstance(priority, bool):
                 raise TaxonomyError(f"{where}.priority must be an integer")
@@ -308,8 +332,10 @@ class Taxonomy:
                     priority=priority,
                     date_regex=date_regex,
                     date_select=date_select,
+                    detail_regex=detail_regex,
                     _pattern=pattern,
                     _date_pattern=date_pattern,
+                    _detail_pattern=detail_pattern,
                 )
             )
 
@@ -387,8 +413,12 @@ def _iso(year: int, month: int, day: int) -> str | None:
         return None
 
 
-def _date_window(text: str) -> str:
-    """The one normalized, length-capped slice every date scan runs over."""
+def _text_window(text: str) -> str:
+    """The one normalized, length-capped slice every rule-driven text scan runs over.
+
+    Not casefolded: a capture taken from this window can become filename text, so its case must
+    survive. Case-insensitive *matching* comes from the patterns' own ``re.IGNORECASE``.
+    """
     return unicodedata.normalize("NFKC", text)[:MAX_MATCH_CHARS]
 
 
@@ -502,7 +532,7 @@ def extract_date(
     """
     if not text:
         return None
-    window = _date_window(text)
+    window = _text_window(text)
     if select == "last":
         return _last_date(window, date_order)
     return _first_date(window, date_order)
@@ -524,7 +554,7 @@ def extract_date_for_rule(
     """
     if not text:
         return (None, None)
-    window = _date_window(text)
+    window = _text_window(text)
 
     if rule is not None and rule._date_pattern is not None:
         for match in rule._date_pattern.finditer(window):
@@ -537,3 +567,50 @@ def extract_date_for_rule(
     select = (rule.date_select if rule is not None else None) or "first"
     iso = _last_date(window, date_order) if select == "last" else _first_date(window, date_order)
     return (iso, select) if iso else (None, None)
+
+
+def _usable_detail(captured: str | None) -> str | None:
+    """A capture fit to become ``{detail}``, or ``None`` so the caller can fall back.
+
+    Rejects a capture holding no alphanumeric character: ``sanitize_component`` would reduce it
+    to the empty string, which would silently *erase* ``{detail}`` from the rendered name rather
+    than fall back to the rule's static ``detail``.
+    """
+    if captured is None:
+        return None
+    captured = captured.strip()
+    if not captured or not any(ch.isascii() and ch.isalnum() for ch in captured):
+        return None
+    return captured[:MAX_DETAIL_CHARS]
+
+
+def extract_detail_for_rule(
+    rule: Rule | None,
+    text: str | None,
+) -> tuple[str | None, str | None]:
+    """The detail a *rule* means, plus where it came from: ``(detail, detail_source)``.
+
+    ``detail_source`` is ``"rule-regex"``, ``"rule"``, or ``None`` when the rule names no detail
+    at all - recorded on the plan entry beside ``date_source``, so a surprising ``{detail}`` is
+    diagnosable from the plan alone. Precedence: the ``detail_regex`` capture first, then the
+    static ``detail`` key as its fallback. A regex that matches nothing, or captures something
+    unusable, is not an error - it degrades, exactly as ``date_regex`` does.
+
+    Unlike a ``date_regex`` capture, which is *parsed* into a validated ISO date, this capture is
+    text on its way to a filename: it is returned raw (``fields`` is the pre-sanitization record
+    per docs/Architecture.md section 6) and :func:`organize.sanitize_component` is what guards the
+    rendered component.
+    """
+    if rule is None:
+        return (None, None)
+
+    if text and rule._detail_pattern is not None:
+        window = _text_window(text)
+        for match in rule._detail_pattern.finditer(window):
+            captured = _usable_detail(match[1])
+            if captured:
+                return (captured, "rule-regex")
+
+    if rule.detail:
+        return (rule.detail, PROVENANCE_RULE)
+    return (None, None)

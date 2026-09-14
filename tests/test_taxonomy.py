@@ -56,6 +56,10 @@ def test_absent_mapping_is_an_empty_taxonomy():
         (_with_rule(date_regex=r"(20\d\d"), "date_regex"),
         (_with_rule(date_regex="statement period"), "capture group"),
         (_with_rule(date_regex=r"(20\d\d)-(\d\d)"), "capture group"),
+        (_with_rule(detail_regex="rx (["), "detail_regex"),
+        (_with_rule(detail_regex=r"rx\s*([0-9]+"), "detail_regex"),
+        (_with_rule(detail_regex=r"rx\s*[0-9]+"), "capture group"),
+        (_with_rule(detail_regex=r"(rx)\s*([0-9]+)"), "capture group"),
         ({**GOOD, "date_order": "ymd"}, "date_order"),
         ({**GOOD, "version": "one"}, "version"),
     ],
@@ -258,6 +262,64 @@ def test_no_parseable_date_anywhere_has_no_source():
         None,
     )
     assert taxonomy.extract_date_for_rule(rule, None, date_order="dmy") == (None, None)
+
+
+# --- per-rule detail selection (#26) ------------------------------------------------------
+
+# Two prescriptions filled the same day share party, doc_type, and date: `{detail}` is the only
+# field left that can separate them, and the number is on the page. Synthetic text in the shape
+# of a receipt - no real prescription number or party enters this repo (Architecture section 8).
+RECEIPT = "Northwind pharmacy receipt - Rx #: 1234567 - Date Filled: 12/3/25 - qty 30"
+
+DETAIL_REGEX = r"rx\s*#?\s*:?\s*([0-9]{4,12})"
+
+
+def test_a_rule_detail_regex_captures_the_per_document_detail():
+    rule = _rule(detail_regex=DETAIL_REGEX)
+    assert taxonomy.extract_detail_for_rule(rule, RECEIPT) == ("1234567", "rule-regex")
+
+
+def test_a_detail_regex_that_finds_nothing_falls_back_to_the_static_detail():
+    rule = _rule(detail_regex=r"account\s+number\s+([0-9]{4})", detail="prescription")
+    assert taxonomy.extract_detail_for_rule(rule, RECEIPT) == ("prescription", "rule")
+
+
+def test_a_rule_with_only_a_static_detail_is_unchanged():
+    """The "existing rules keep working" proof: no detail_regex, no behaviour change."""
+    assert taxonomy.extract_detail_for_rule(_rule(detail="prescription"), RECEIPT) == (
+        "prescription",
+        "rule",
+    )
+    assert taxonomy.extract_detail_for_rule(_rule(), RECEIPT) == (None, None)
+    assert taxonomy.extract_detail_for_rule(None, RECEIPT) == (None, None)
+    assert taxonomy.extract_detail_for_rule(_rule(detail_regex=DETAIL_REGEX), None) == (
+        None,
+        None,
+    )
+
+
+def test_a_detail_capture_must_hold_an_alphanumeric_character():
+    """An all-punctuation capture would sanitize away to nothing and silently erase {detail},
+    so it is refused in favour of the static fallback rather than accepted."""
+    rule = _rule(detail_regex=r"receipt\s*(-+)", detail="prescription")
+    assert taxonomy.extract_detail_for_rule(rule, RECEIPT) == ("prescription", "rule")
+
+
+def test_a_detail_capture_is_length_capped():
+    rule = _rule(detail_regex=r"ref\s+(\S+)")
+    text = "ref " + ("x" * 300)
+    captured, source = taxonomy.extract_detail_for_rule(rule, text)
+    assert source == "rule-regex" and len(captured) == taxonomy.MAX_DETAIL_CHARS
+
+
+def test_a_detail_regex_matches_case_insensitively_but_keeps_the_captures_case():
+    """IGNORECASE does the matching; the window is not casefolded, because the capture becomes
+    filename text and its case must survive."""
+    rule = _rule(detail_regex=r"policy\s+([A-Z]{2}-[0-9]{4})")
+    assert taxonomy.extract_detail_for_rule(rule, "POLICY QX-7781 renewed") == (
+        "QX-7781",
+        "rule-regex",
+    )
 
 
 def test_match_document_carries_the_matched_rule_without_changing_its_shape():
