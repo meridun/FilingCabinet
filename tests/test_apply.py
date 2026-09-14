@@ -11,7 +11,7 @@ import json
 import pytest
 
 from filingcabinet import apply as apply_mod
-from filingcabinet import db, organize
+from filingcabinet import db, organize, taxonomy as taxonomy_mod
 
 
 def _migrated():
@@ -368,6 +368,66 @@ def test_apply_requires_a_migrated_database(tmp_path):
     conn = db.connect(":memory:")
     with pytest.raises(db.NotMigratedError):
         apply_mod.apply_plan(conn, _plan([], tmp_path), root=tmp_path)
+
+
+# --- issue #26: a suffixed in-plan collision survives the propose -> apply -> undo round trip
+
+
+COLLIDING_TAXONOMY = {
+    "version": 1,
+    "doc_types": ["invoice"],
+    "parties": {"northwind": {"display": "Northwind"}},
+    "rules": [
+        {
+            "id": "northwind-invoice",
+            "party": "northwind",
+            "doc_type": "invoice",
+            "all": ["northwind"],
+            "any": ["invoice"],
+            "folder": "Suppliers",
+            "priority": 100,
+        }
+    ],
+}
+
+
+def _seed_with_text(conn, root, rel_path, text, sha):
+    document_id, path = _seed(conn, root, rel_path, body=text.encode("utf-8"), sha=sha)
+    conn.execute(
+        "UPDATE document SET ocr_text = ? WHERE document_id = ?", (text, document_id)
+    )
+    conn.commit()
+    return document_id, path
+
+
+def test_apply_moves_both_halves_of_a_suffixed_collision(tmp_path):
+    """AC 3, through the *real* `build_plan`: two documents that render one name both move,
+    and `undo` puts both back. Hand-built entries would not prove the suffix reaches `apply`."""
+    conn = _migrated()
+    _seed_with_text(conn, tmp_path, "inbox/a.pdf", "Northwind invoice one", "a" * 64)
+    _seed_with_text(conn, tmp_path, "inbox/b.pdf", "Northwind invoice two", "b" * 64)
+
+    entries, summary = organize.build_plan(
+        conn,
+        tmp_path,
+        taxonomy=taxonomy_mod.Taxonomy.from_mapping(COLLIDING_TAXONOMY),
+        template=organize.DEFAULT_TEMPLATE,
+    )
+    assert summary.collision == 0 and summary.move == 2
+    plan = _plan([entry.as_dict() for entry in entries], tmp_path)
+
+    outcomes, applied = apply_mod.apply_plan(conn, plan, root=tmp_path)
+    assert (applied.moved, applied.skipped, applied.errors) == (2, 0, 0)
+    assert all(o.status == apply_mod.STATUS_MOVED for o in outcomes)
+    assert _tree(tmp_path) == [
+        "Suppliers/Northwind_invoice.pdf",
+        "Suppliers/Northwind_invoice_bbbbbb.pdf",
+    ]
+    assert len(_log(conn)) == 2
+
+    _, reversed_ = apply_mod.undo_plan(conn, "plan-test", root=tmp_path)
+    assert (reversed_.reversed, reversed_.errors) == (2, 0)
+    assert _tree(tmp_path) == ["inbox/a.pdf", "inbox/b.pdf"]
 
 
 # --- undo_plan ---------------------------------------------------------------------------

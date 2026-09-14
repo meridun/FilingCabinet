@@ -15,6 +15,7 @@ where it is absent. The migration and the plan-directory guard always run.
 import hashlib
 import json
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -403,5 +404,92 @@ def test_propose_smoke_widened_date_formats_do_not_collide(tmp_path):
     )
 
     # A better date is still only a *proposal*: nothing under the root moved or changed.
+    assert _tree_fingerprint(root) == fingerprint
+    assert not (root / "plans").exists()
+
+
+# --- issue #26: per-rule detail_regex and the deterministic collision suffix ----------------
+#
+# The gating real run for "same-day documents stop dropping out of the plan". Two receipts of
+# one party, doc type, and date - the routine case two prescriptions filled the same day makes -
+# proposed twice: once with a rule that names no detail (so the suffix is what keeps both in the
+# plan) and once with `detail_regex` (so the number on the page is what separates them).
+# Synthetic text in the *shape* of the reported documents; no user document, real party, or real
+# prescription number enters this repo (docs/Architecture.md section 8), so re-running the pilot
+# corpus stays an operator check.
+
+SAME_DAY_LINES = {
+    "scan-301.pdf": "Northwind Pharmacy receipt - Rx #: 1234567 - Date Filled: 04/07/2025",
+    "scan-302.pdf": "Northwind Pharmacy receipt - Date Filled: 04/07/2025 - qty 90",
+}
+
+SAME_DAY_STEM = "2025-07-04_Northwind_Pharmacy_receipt"
+DETAIL_KEYS = (
+    r"detail_regex = 'rx\s*#?\s*:?\s*([0-9]{4,12})'" + "\n" + 'detail = "prescription"\n'
+)
+
+
+@requires_pymupdf
+def test_propose_smoke_detail_regex_and_collision_suffix(tmp_path):
+    """Two same-day receipts: suffixed when the rule names no detail, named apart when it does."""
+    db = tmp_path / "fc.db"
+    root = tmp_path / "root"
+    (root / "inbox").mkdir(parents=True)
+    for name, line in SAME_DAY_LINES.items():
+        _write_pdf(root / "inbox" / name, [line])
+    taxonomy = tmp_path / "taxonomy.toml"
+    plan_dir = tmp_path / "plans"  # outside the root, as always
+
+    assert _run(db, "migrate", "--create")["created"] is True
+    assert _run(db, "ingest", "--root", str(root))["new"] == 2
+    assert _run(db, "ocr", "run", "--root", str(root))["errors"] == 0
+    fingerprint = _tree_fingerprint(root)
+
+    def propose(rule_keys):
+        taxonomy.write_text(RECEIPT_TAXONOMY + rule_keys, encoding="utf-8")
+        out = _run(db, "propose", "--root", str(root), "--taxonomy", str(taxonomy),
+                   "--plan-dir", str(plan_dir))
+        written = json.loads(pathlib.Path(out["plan"]).read_text(encoding="utf-8"))
+        # The plan file is what phase 6 reads: it must carry the same detail provenance.
+        assert [e["detail_source"] for e in written["entries"]] == [
+            e["detail_source"] for e in out["entries"]
+        ]
+        return out
+
+    # No detail keys: one rendered name for both documents. The reported failure was that the
+    # second was dropped as a `collision`; now it is a `move` under a content-derived suffix.
+    plain = propose("")
+    first, second = plain["entries"]
+    assert (plain["collision"], plain["move"]) == (0, 2)
+    assert [e["status"] for e in plain["entries"]] == ["move", "move"]
+    assert first["target_path"] == f"Health/Northwind/{SAME_DAY_STEM}.pdf"
+    assert first["note"] is None and first["detail_source"] is None
+    assert re.fullmatch(
+        rf"Health/Northwind/{SAME_DAY_STEM}_[0-9a-f]{{6}}\.pdf", second["target_path"]
+    )
+    assert second["note"] == f"suffixed: collision with document {first['document_id']}"
+
+    # Stable across runs: the suffix comes from the content hash, not from a counter.
+    repeated = propose("")
+    assert [e["target_path"] for e in repeated["entries"]] == [
+        e["target_path"] for e in plain["entries"]
+    ]
+
+    # With `detail_regex` the number on the page separates them, so no suffix is needed: the
+    # captured Rx for the one that carries it, the static fallback for the one that does not.
+    detailed = propose(DETAIL_KEYS)
+    by_path = {e["current_path"]: e for e in detailed["entries"]}
+    captured = by_path["inbox/scan-301.pdf"]
+    fallback = by_path["inbox/scan-302.pdf"]
+    assert (detailed["collision"], detailed["move"]) == (0, 2)
+    assert captured["fields"]["detail"] == "1234567"
+    assert captured["detail_source"] == "rule-regex"
+    assert captured["target_path"] == f"Health/Northwind/{SAME_DAY_STEM}_1234567.pdf"
+    assert fallback["fields"]["detail"] == "prescription"
+    assert fallback["detail_source"] == "rule"
+    assert fallback["target_path"] == f"Health/Northwind/{SAME_DAY_STEM}_prescription.pdf"
+    assert all(e["note"] is None for e in detailed["entries"])
+
+    # Completing the plan is still only a *proposal*: nothing under the root moved or changed.
     assert _tree_fingerprint(root) == fingerprint
     assert not (root / "plans").exists()

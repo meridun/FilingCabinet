@@ -211,6 +211,75 @@ def test_an_agent_date_outranks_the_rules_date_regex(tmp_path):
     assert entries[0].date_source == "agent"
 
 
+# --- issue #26: per-rule detail selection ---------------------------------------------------
+
+DETAIL_TEXT = "Northwind invoice no 7 - ref: AB-1234 - delivered to the depot"
+DETAIL_TAXONOMY = {
+    **TAXONOMY,
+    "rules": [{**TAXONOMY["rules"][0], "detail_regex": r"ref:\s*(\S+)"}],
+}
+
+
+def test_a_rule_detail_regex_lands_in_the_proposed_name(tmp_path):
+    conn = _migrated()
+    _add_document(conn, "scan.pdf", DETAIL_TEXT)
+    entries, _ = build(conn, tmp_path, taxonomy=_tax(DETAIL_TAXONOMY))
+    entry = entries[0]
+    assert entry.fields["detail"] == "AB-1234" and entry.detail_source == "rule-regex"
+    assert entry.target_name == "Northwind_invoice_AB-1234.pdf"
+
+
+def test_a_static_detail_is_sourced_rule(tmp_path):
+    conn = _migrated()
+    _add_document(conn, "scan.pdf", DETAIL_TEXT)
+    rule = {**TAXONOMY["rules"][0], "detail": "depot"}
+    entries, _ = build(conn, tmp_path, taxonomy=_tax({**TAXONOMY, "rules": [rule]}))
+    assert entries[0].fields["detail"] == "depot" and entries[0].detail_source == "rule"
+
+
+def test_a_rule_naming_no_detail_has_no_detail_source(tmp_path):
+    conn = _migrated()
+    _add_document(conn, "scan.pdf", DETAIL_TEXT)
+    entries, _ = build(conn, tmp_path)
+    assert entries[0].fields["detail"] is None and entries[0].detail_source is None
+
+
+def test_an_unclassified_entry_has_no_detail_source(tmp_path):
+    conn = _migrated()
+    _add_document(conn, "mystery.pdf", "nothing recognisable here")
+    entries, _ = build(conn, tmp_path)
+    assert entries[0].detail_source is None
+
+
+def test_an_agent_detail_outranks_the_rules_detail_regex(tmp_path):
+    conn = _migrated()
+    document_id = _add_document(conn, "scan.pdf", DETAIL_TEXT)
+    organize.record_agent_classification(
+        conn, document_id, party="Northwind", doc_type="invoice", detail="camden"
+    )
+    entries, _ = build(conn, tmp_path, taxonomy=_tax(DETAIL_TAXONOMY))
+    assert entries[0].fields["detail"] == "camden" and entries[0].detail_source == "agent"
+
+
+def test_an_agent_verdict_without_a_detail_has_no_detail_source(tmp_path):
+    """An agent verdict is the whole classification: it does not fall back to a rule's keys."""
+    conn = _migrated()
+    document_id = _add_document(conn, "scan.pdf", DETAIL_TEXT)
+    organize.record_agent_classification(conn, document_id, party="Acme", doc_type="invoice")
+    entries, _ = build(conn, tmp_path, taxonomy=_tax(DETAIL_TAXONOMY))
+    assert entries[0].fields["detail"] is None and entries[0].detail_source is None
+
+
+def test_a_detail_regex_capture_cannot_steer_the_target_out_of_the_root(tmp_path):
+    """The capture is OCR text on its way to a filename: `sanitize_component` is the guard."""
+    conn = _migrated()
+    _add_document(conn, "scan.pdf", "Northwind invoice no 7 - ref: ../../../etc/passwd - x")
+    entries, _ = build(conn, tmp_path, taxonomy=_tax(DETAIL_TAXONOMY))
+    entry = entries[0]
+    assert entry.fields["detail"] == "../../../etc/passwd"  # raw in `fields`, by design
+    assert entry.target_path == "Suppliers/Northwind/Northwind_invoice_etc_passwd.pdf"
+
+
 def test_build_plan_leaves_an_unmatched_document_unclassified(tmp_path):
     conn = _migrated()
     _add_document(conn, "mystery.pdf", "nothing recognisable here")
@@ -244,14 +313,68 @@ def test_a_target_equal_to_the_current_path_is_a_noop(tmp_path):
     assert entries[0].status == organize.STATUS_NOOP and summary.noop == 1
 
 
-def test_two_documents_rendering_one_name_collide(tmp_path):
+def test_two_documents_rendering_one_name_are_suffixed_not_dropped(tmp_path):
+    """#26: the second claimer is retargeted, not dropped, so both stay in the plan.
+
+    The suffix *value* is content-derived and therefore stable; which twin keeps the plain name
+    follows `ORDER BY document_id`, so a re-ingest that renumbers documents may swap them. That
+    is acceptable - both entries are proposals a human reviews.
+    """
     conn = _migrated()
-    _add_document(conn, "a.pdf", "Northwind invoice one", sha="sha-a")
-    _add_document(conn, "b.pdf", "Northwind invoice two", sha="sha-b")
+    _add_document(conn, "a.pdf", "Northwind invoice one", sha="a" * 64)
+    _add_document(conn, "b.pdf", "Northwind invoice two", sha="b" * 64)
+    entries, summary = build(conn, tmp_path)
+    assert [e.status for e in entries] == [organize.STATUS_MOVE, organize.STATUS_MOVE]
+    assert entries[0].target_name == "Northwind_invoice.pdf"
+    assert entries[1].target_name == "Northwind_invoice_bbbbbb.pdf"
+    assert entries[1].target_path == "Suppliers/Northwind/Northwind_invoice_bbbbbb.pdf"
+    assert entries[1].note == f"suffixed: collision with document {entries[0].document_id}"
+    assert entries[0].note is None
+    assert summary.collision == 0 and summary.move == 2
+
+    again, _ = build(conn, tmp_path)  # AC 2: the suffix is stable across runs
+    assert [e.target_name for e in again] == [e.target_name for e in entries]
+
+
+def test_a_document_without_a_usable_sha_stays_a_collision(tmp_path):
+    """No junk suffix from a malformed hash: degrade to today's behaviour instead."""
+    conn = _migrated()
+    _add_document(conn, "a.pdf", "Northwind invoice one", sha="a" * 64)
+    _add_document(conn, "b.pdf", "Northwind invoice two", sha="not-hex")
     entries, summary = build(conn, tmp_path)
     assert [e.status for e in entries] == [organize.STATUS_MOVE, organize.STATUS_COLLISION]
     assert "already claims" in entries[1].note
     assert summary.collision == 1
+
+
+def test_a_foreign_file_at_the_suffixed_name_still_collides(tmp_path):
+    """The suffixed target is re-probed on disk: an existing file no plan entry owns wins."""
+    conn = _migrated()
+    _add_document(conn, "a.pdf", "Northwind invoice one", sha="a" * 64)
+    _add_document(conn, "b.pdf", "Northwind invoice two", sha="b" * 64)
+    folder = tmp_path / "Suppliers" / "Northwind"
+    folder.mkdir(parents=True)
+    (folder / "Northwind_invoice_bbbbbb.pdf").write_bytes(b"not ours")
+    entries, summary = build(conn, tmp_path)
+    assert entries[1].status == organize.STATUS_COLLISION and summary.collision == 1
+
+
+def test_a_document_already_at_its_suffixed_name_is_a_noop_on_re_propose(tmp_path):
+    """The idempotency hinge: a noop claims its key, so re-proposing after `apply` does not
+    hand the already-filed twin a fresh collision."""
+    conn = _migrated()
+    _add_document(
+        conn, "Suppliers/Northwind/Northwind_invoice.pdf", "Northwind invoice one", sha="a" * 64
+    )
+    _add_document(
+        conn,
+        "Suppliers/Northwind/Northwind_invoice_bbbbbb.pdf",
+        "Northwind invoice two",
+        sha="b" * 64,
+    )
+    entries, summary = build(conn, tmp_path)
+    assert [e.status for e in entries] == [organize.STATUS_NOOP, organize.STATUS_NOOP]
+    assert summary.collision == 0 and summary.noop == 2
 
 
 def test_two_documents_with_two_digit_year_dates_do_not_collide(tmp_path):
@@ -367,8 +490,8 @@ def test_write_plan_round_trips(tmp_path):
     assert payload["summary"]["documents"] == 1
     assert list(payload["entries"][0]) == [
         "document_id", "sha256", "current_path", "target_path", "folder", "target_name",
-        "fields", "tags", "provenance", "rule_id", "date_source", "status", "note",
-        "current_mtime", "current_size",
+        "fields", "tags", "provenance", "rule_id", "date_source", "detail_source", "status",
+        "note", "current_mtime", "current_size",
     ]
     assert not list(target.parent.glob("*.tmp"))  # atomic write leaves no scratch behind
 

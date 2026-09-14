@@ -39,6 +39,7 @@ from .taxonomy import (
     Taxonomy,
     TaxonomyError,
     extract_date_for_rule,
+    extract_detail_for_rule,
     match_document,
 )
 
@@ -55,6 +56,12 @@ STATUS_NOOP = "noop"
 STATUS_UNCLASSIFIED = "unclassified"
 STATUS_COLLISION = "collision"
 STATUS_ERROR = "error"
+
+# A residual collision between two *in-plan* documents is broken by appending this many
+# characters of the second document's sha256 to the rendered stem. Content-derived, so the
+# suffix is the same on every run over an unchanged index.
+COLLISION_SUFFIX_CHARS = 6
+_HEX_RE = re.compile(r"[^0-9a-f]")
 
 _PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
@@ -109,6 +116,9 @@ class PlanEntry:
     # Which selector produced `fields["doc_date"]`: rule-regex | first | last | agent, or None
     # when no date was found. Makes a wrong date diagnosable from the plan alone.
     date_source: str | None = None
+    # Which source produced `fields["detail"]`: rule-regex | rule | agent, or None when nothing
+    # did. The `date_source` mirror, one field over.
+    detail_source: str | None = None
     status: str = STATUS_UNCLASSIFIED
     note: str | None = None
     # The stability baseline `apply` re-checks before it moves the file (docs/Architecture.md §6):
@@ -272,6 +282,33 @@ def _rule_verdict(taxonomy: Taxonomy, text: str | None) -> dict | None:
     }
 
 
+def _collision_suffix(sha256: str | None) -> str | None:
+    """``sha256``'s first six hex characters, or ``None`` when it has none to give.
+
+    Derived *only* from the index-computed content hash - never from OCR text, the current
+    filename, or the document id - so nothing inside a scanned document can steer the suffix. A
+    malformed or absent hash yields ``None``, and the caller keeps today's ``collision`` status
+    rather than inventing a junk filename.
+    """
+    if not sha256:
+        return None
+    hexed = _HEX_RE.sub("", str(sha256).casefold())
+    return hexed[:COLLISION_SUFFIX_CHARS] if len(hexed) >= COLLISION_SUFFIX_CHARS else None
+
+
+def _inside_root(resolved_root: Path, target_path: str) -> bool:
+    """Guard layer 3: does ``target_path`` resolve inside the document root?
+
+    A helper rather than an inline block because a suffixed target is a *different* path and
+    must be re-checked; inheriting the base target's verdict would skip the check.
+    """
+    try:
+        resolved = (resolved_root / target_path).resolve()
+        return resolved == resolved_root or resolved.is_relative_to(resolved_root)
+    except (OSError, ValueError):
+        return False
+
+
 def plan_document(
     row: Mapping,
     *,
@@ -303,11 +340,19 @@ def plan_document(
         doc_date, date_source = extract_date_for_rule(
             verdict["rule"], row["ocr_text"], date_order=taxonomy.date_order
         )
+    # The same precedence for `detail`, branching on provenance rather than truthiness: a rule
+    # verdict's `detail` is the static fallback `extract_detail_for_rule` itself applies, so
+    # testing it here would pre-empt the rule's own `detail_regex`.
+    if verdict["provenance"] == PROVENANCE_AGENT:
+        detail = verdict["detail"]
+        detail_source = PROVENANCE_AGENT if detail else None
+    else:
+        detail, detail_source = extract_detail_for_rule(verdict["rule"], row["ocr_text"])
     fields = {
         "doc_date": doc_date,
         "party": verdict["party"],
         "doc_type": verdict["doc_type"],
-        "detail": verdict["detail"],
+        "detail": detail,
     }
     common = {
         "fields": fields,
@@ -315,6 +360,7 @@ def plan_document(
         "provenance": verdict["provenance"],
         "rule_id": verdict["rule_id"],
         "date_source": date_source,
+        "detail_source": detail_source,
     }
 
     def failed(note: str) -> PlanEntry:
@@ -335,12 +381,7 @@ def plan_document(
     target_path = f"{folder}/{name}{current.suffix}" if folder else f"{name}{current.suffix}"
 
     resolved_root = root.resolve()
-    try:
-        resolved = (resolved_root / target_path).resolve()
-        inside = resolved == resolved_root or resolved.is_relative_to(resolved_root)
-    except (OSError, ValueError):
-        inside = False
-    if not inside:
+    if not _inside_root(resolved_root, target_path):
         return failed(f"target {target_path} resolves outside the document root")
 
     entry = PlanEntry(
@@ -353,28 +394,58 @@ def plan_document(
             "status": STATUS_MOVE,
         }
     )
-    if target_path == current_path:
-        return PlanEntry(**{**asdict(entry), "status": STATUS_NOOP})
+
+    def claim(claim_key: str) -> None:
+        if taken is not None:
+            taken.setdefault(claim_key, document_id)
 
     key = target_path.casefold()  # the Windows host is case-insensitive; be strict everywhere
+    if target_path == current_path:
+        # A noop claims its key too: without this, re-proposing after `apply` would see the
+        # already-filed document's file on disk and hand its twin a fresh collision, so the
+        # suffix would not survive a second run.
+        claim(key)
+        return PlanEntry(**{**asdict(entry), "status": STATUS_NOOP})
+
+    def collided(note: str) -> PlanEntry:
+        return PlanEntry(**{**asdict(entry), "status": STATUS_COLLISION, "note": note})
+
     if taken is not None and key in taken:
+        # Two in-plan documents want one name. Break the tie with a content-derived suffix so
+        # both stay in the plan, rather than dropping the second: the first claimer is never
+        # suffixed, and every suffixed entry says which document it collided with.
+        claimed_by = taken[key]
+        base_note = f"document {claimed_by} already claims {target_path}"
+        suffix = _collision_suffix(base.sha256)
+        if suffix is None:
+            return collided(base_note)
+        suffixed_name = f"{name}_{suffix}{current.suffix}"
+        # `[0-9a-f_]` is inside `sanitize_component`'s safe set, so the stem stays sanitized and
+        # is deliberately not re-sanitized (that would re-cap an already-capped component).
+        suffixed_path = f"{folder}/{suffixed_name}" if folder else suffixed_name
+        if not _inside_root(resolved_root, suffixed_path):
+            return failed(f"target {suffixed_path} resolves outside the document root")
+        suffixed = PlanEntry(
+            **{**asdict(entry), "target_path": suffixed_path, "target_name": suffixed_name}
+        )
+        suffixed_key = suffixed_path.casefold()
+        if suffixed_path == current_path:
+            claim(suffixed_key)
+            return PlanEntry(**{**asdict(suffixed), "status": STATUS_NOOP})
+        if (taken is not None and suffixed_key in taken) or (
+            resolved_root / suffixed_path
+        ).exists():
+            return collided(base_note)
+        claim(suffixed_key)
         return PlanEntry(
             **{
-                **asdict(entry),
-                "status": STATUS_COLLISION,
-                "note": f"document {taken[key]} already claims {target_path}",
+                **asdict(suffixed),
+                "note": f"suffixed: collision with document {claimed_by}",
             }
         )
     if (resolved_root / target_path).exists():
-        return PlanEntry(
-            **{
-                **asdict(entry),
-                "status": STATUS_COLLISION,
-                "note": f"{target_path} already exists on disk",
-            }
-        )
-    if taken is not None:
-        taken[key] = document_id
+        return collided(f"{target_path} already exists on disk")
+    claim(key)
     return entry
 
 
