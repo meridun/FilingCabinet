@@ -11,9 +11,9 @@ requires-python = ">=3.11"
 [project.optional-dependencies]
 # Phase 4 OCR ladder, rung 1 (local). PyMuPDF reads embedded text layers and rasterizes
 # pages that lack one; `tesseract` itself is a soft system dependency (docs/Development.md).
-ocr = ["PyMuPDF>=1.24"]
+ocr = ["PyMuPDF>=1.24.3"]
 # Phase 3 near-duplicate detection: perceptual page hashes.
-dedup = ["PyMuPDF>=1.24", "ImageHash>=4.3", "Pillow>=10"]
+dedup = ["PyMuPDF>=1.24.3", "ImageHash>=4.3", "Pillow>=10"]
 # Phase 7 MCP wrapper. The engine and CLI need none of it.
 mcp = ["mcp>=1.0"]
 

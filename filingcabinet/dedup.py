@@ -43,7 +43,7 @@ VALID_KINDS = ("near", "subset", "exact")
 VALID_VERDICTS = ("dup", "not_dup")
 
 try:  # PyMuPDF is an optional extra ([ocr]/[dedup]); rendering degrades to unavailable.
-    import fitz as _fitz
+    import pymupdf as _fitz
 except Exception:  # pragma: no cover - depends on the local environment
     _fitz = None
 
