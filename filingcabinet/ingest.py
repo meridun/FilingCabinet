@@ -38,7 +38,7 @@ DEFAULT_EXCLUDES: tuple[str, ...] = (
 _NUMBERED_COPY = re.compile(r"\s\(\d+\)$")
 
 try:  # PyMuPDF is an optional extra ([ocr]/[dedup]); page counts degrade to None.
-    import fitz as _fitz
+    import pymupdf as _fitz
 except Exception:  # pragma: no cover - depends on the local environment
     _fitz = None
 

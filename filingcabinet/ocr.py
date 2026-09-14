@@ -64,7 +64,7 @@ _COARSE_SOURCE = {
 _COARSE_RANK = {"local": 0, "drive": 1, "vision": 2}
 
 try:  # PyMuPDF is an optional extra ([ocr]/[dedup]); OCR degrades to unavailable.
-    import fitz as _fitz
+    import pymupdf as _fitz
 except Exception:  # pragma: no cover - depends on the local environment
     _fitz = None
 
