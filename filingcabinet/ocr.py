@@ -72,8 +72,16 @@ NOTE_RUNG_UNAVAILABLE = "rung_unavailable:"
 NOTE_DRIVE_EMPTY = "drive_empty"
 
 # Drive returns image files with a trailing `Image labels: [...]` machine annotation. Anchored at
-# the end of the string (no interior line is touched) and linear-time: no nested quantifiers.
-_DRIVE_TRAILER_RE = re.compile(r"(?:\A|\n)[ \t]*Image labels:[^\n]*\s*\Z")
+# the end of the string, so no interior line is touched. Both quantifiers are *possessive* (`*+`,
+# Python >= 3.11) and that is load-bearing, not style: `[^\n]*` and `\s*` are adjacent over
+# overlapping classes (space, tab) in front of an anchor, so a backtracking engine retries every
+# split of a trailing whitespace run - quadratic in that run's length whenever the tail fails to
+# match (measured 3.5 s at 32k spaces, extrapolating to about an hour at the MAX_SUBMIT_CHARS
+# cap). Possessive quantifiers never give characters back, which makes the scan linear, and the
+# accepted language is unchanged: any character `[^\n]*+` keeps from `\s*+` is itself whitespace
+# that `\s*+` would have had to consume to reach `\Z` anyway.
+# `test_strip_drive_trailer_runs_linearly` enforces the property instead of asserting it.
+_DRIVE_TRAILER_RE = re.compile(r"(?:\A|\n)[ \t]*Image labels:[^\n]*+\s*+\Z")
 
 # page_ocr.ocr_source is the fine vocabulary; document.ocr_source keeps §5's coarse one.
 _COARSE_SOURCE = {
@@ -747,7 +755,9 @@ def strip_drive_trailer(text: str) -> str:
     """Drop Drive's trailing `Image labels: [...]` annotation from image-file text.
 
     Only a trailer is removed - an interior line that happens to mention `Image labels:` is
-    part of the document and is kept. Trailing whitespace goes with it.
+    part of the document and is kept. Trailing whitespace goes with it. Runs linear in the
+    length of the input whether or not it matches (see `_DRIVE_TRAILER_RE`), because this is
+    the first thing untrusted third-party text meets after the raw-length cap.
     """
     if not isinstance(text, str):
         raise ValueError("submitted text must be a string")

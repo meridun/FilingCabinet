@@ -1,5 +1,6 @@
 import hashlib
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -527,6 +528,28 @@ def test_strip_drive_trailer_only_strips_a_trailer():
     interior = "Image labels: [a]\nthe real last line"
     assert ocr.strip_drive_trailer(interior) == interior
     assert ocr.strip_drive_trailer("body") == "body"
+
+
+def test_strip_drive_trailer_runs_linearly():
+    """Drive text is untrusted, so the trailer scan must not backtrack.
+
+    A long whitespace run before a non-matching tail is the pathological shape: with greedy
+    quantifiers the engine retries every split of the run and the cost is quadratic (about 3.5 s
+    at 32k spaces, an hour at the MAX_SUBMIT_CHARS cap). The bound below is deliberately loose -
+    it is a regression trip-wire on the shape of the pattern, not a benchmark.
+    """
+    run = " " * 200_000
+    pathological = "Image labels: x" + run + "\ny"
+
+    started = time.perf_counter()
+    assert ocr.strip_drive_trailer(pathological) == pathological
+    elapsed = time.perf_counter() - started
+    assert elapsed < 2.0, f"strip_drive_trailer backtracked: {elapsed:.1f}s on 200k spaces"
+
+    # The same run in a position that *does* match is stripped, and just as promptly.
+    started = time.perf_counter()
+    assert ocr.strip_drive_trailer("body\nImage labels: [a]" + run) == "body"
+    assert time.perf_counter() - started < 2.0
 
 
 def test_submit_drive_marks_every_pending_page(conn):
