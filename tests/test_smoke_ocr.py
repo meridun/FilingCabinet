@@ -34,14 +34,18 @@ LETTER = (
 )
 
 
-def _run(db, *args):
-    proc = subprocess.run(
-        [sys.executable, "-m", "filingcabinet.cli", "--db", str(db), "--json", *args],
-        capture_output=True,
-        text=True,
-        check=True,
+def _cli(db, *args, config=None, stdin=None, check=True):
+    """The real CLI in a real subprocess; `config` and `stdin` are for the drive rung."""
+    cmd = [sys.executable, "-m", "filingcabinet.cli", "--db", str(db), "--json"]
+    if config is not None:
+        cmd += ["--config", str(config)]
+    return subprocess.run(
+        [*cmd, *args], capture_output=True, text=True, input=stdin, check=check
     )
-    return json.loads(proc.stdout)
+
+
+def _run(db, *args, **kwargs):
+    return json.loads(_cli(db, *args, **kwargs).stdout)
 
 
 def _tree_fingerprint(root):
@@ -56,13 +60,21 @@ def _tree_fingerprint(root):
     }
 
 
-def _write_pdf(path, lines):
+def _write_pdf(path, pages, render_mode=0):
+    """One page per element; an element may be a single line or a list of lines.
+
+    ``render_mode=3`` writes the text invisibly - the shape a thin scanner-embedded OCR layer
+    has: the text layer carries it, but a rasterized page shows tesseract nothing.
+    """
     import fitz
 
     doc = fitz.open()
-    for line in lines:
+    for lines in pages:
         page = doc.new_page()
-        page.insert_text((72, 100), line, fontsize=9)
+        y = 100
+        for line in [lines] if isinstance(lines, str) else lines:
+            page.insert_text((72, y), line, fontsize=9, render_mode=render_mode)
+            y += 14
     doc.save(path)
     doc.close()
 
@@ -138,3 +150,142 @@ def _document_id_of(db, rel_path):
         conn.close()
     assert row is not None
     return int(row[0])
+
+
+def _query(db, sql, params):
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute(sql, params)]
+    finally:
+        conn.close()
+
+
+def _pages_of(db, document_id):
+    return {
+        row["page_number"]: row
+        for row in _query(
+            db,
+            "SELECT page_number, status, rung, ocr_source, confidence, text, note "
+            "FROM page_ocr WHERE document_id = ? ORDER BY page_number",
+            (document_id,),
+        )
+    }
+
+
+# Drive returns image files with this machine annotation appended; it must not reach page_ocr.
+DRIVE_BLOB = (
+    "Gas meter reading 41215 recorded at the Camden depot on 3 February 2026.\n"
+    "Image labels: this interior mention belongs to the document and must survive.\n"
+    "The engineer signature block closes the second page.\n"
+    "\nImage labels: [receipt, text, document]\n"
+)
+
+
+@requires_pymupdf
+def test_drive_rung_smoke_end_to_end(tmp_path):
+    """Issue #9's acceptance criteria, walked through the real CLI over a real tree.
+
+    The gating real run for the agent-driven `drive` rung: a ladder that parks pages at
+    `pending_drive` instead of `pending_vision`, a document-level submit resolved by sha256,
+    the `Image labels:` trailer stripped, an empty Drive answer leaving the local read as the
+    fallback, and the document tree untouched throughout (``docs/Architecture.md`` section 6).
+    """
+    db = tmp_path / "fc.db"
+    root = tmp_path / "root"
+    (root / "scans").mkdir(parents=True)
+    (root / "archive").mkdir(parents=True)
+    # Three pages: a dense text layer, then two the local rung cannot read.
+    _write_pdf(
+        root / "scans" / "invoice.pdf",
+        [[LETTER[i : i + 90] for i in range(0, len(LETTER), 90)], "", ""],
+    )
+    # Same basename in another directory: the ambiguous-title case the spike found on Drive.
+    # Its text layer is thin and invisible, so the local rung carries a low-confidence read it
+    # cannot clear the bar with, whether or not this host has tesseract.
+    _write_pdf(root / "archive" / "invoice.pdf", ["Faint carbon copy receipt zzqq"], render_mode=3)
+
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[paths]\nroot = "%s"\n\n[ocr]\nladder = ["local", "drive", "vision"]\n'
+        % root.as_posix(),
+        encoding="utf-8",
+    )
+
+    assert _run(db, "migrate", "--create")["created"] is True
+    assert _run(db, "ingest", "--root", str(root))["new"] == 2
+    fingerprint = _tree_fingerprint(root)
+
+    invoice = _document_id_of(db, "scans/invoice.pdf")
+    faint = _document_id_of(db, "archive/invoice.pdf")
+    sha = _query(db, "SELECT sha256 FROM document WHERE document_id = ?", (invoice,))[0]["sha256"]
+
+    # AC 3: with `drive` before `vision`, deferred pages park at `pending_drive`.
+    first = _run(db, "ocr", "run", "--root", str(root), config=config)
+    assert first["errors"] == 0 and first["pending_vision"] == 0
+    assert first["pending_drive"] == 3  # two blank invoice pages + the faint receipt
+    assert first["pages"] == first["ok"] + first["pending_drive"] + first["skipped"] + \
+        first["exhausted"]
+    pages = _pages_of(db, invoice)
+    assert pages[1]["status"] == "ok"  # the text layer finished at the local rung
+    assert [pages[2]["status"], pages[3]["status"]] == ["pending_drive", "pending_drive"]
+    # The thin local read is carried onto the deferred row rather than blanked.
+    carried = _pages_of(db, faint)[1]
+    assert carried["status"] == "pending_drive" and (carried["text"] or "").strip()
+
+    # AC 3: a page waiting for the agent is sticky - a re-run must not escalate it to vision.
+    _run(db, "ocr", "run", "--root", str(root), config=config)
+    assert _pages_of(db, invoice)[2]["status"] == "pending_drive"
+    assert _pages_of(db, faint)[1]["status"] == "pending_drive"
+
+    # AC 2: a bare filename is a title, and a title is ambiguous - never silently matched.
+    refused = _cli(
+        db, "ocr", "submit", "--source", "drive", "--rel-path", "invoice.pdf",
+        "--text-file", "-", config=config, stdin=DRIVE_BLOB, check=False,
+    )
+    assert refused.returncode != 0 and "ambiguous" in refused.stderr
+
+    # AC 1, 4, 6: one document-level submit, resolved by sha256, marks every pending page.
+    submitted = _run(
+        db, "ocr", "submit", "--source", "drive", "--sha256", sha,
+        "--text-file", "-", config=config, stdin=DRIVE_BLOB,
+    )
+    assert (submitted["pages_marked"], submitted["text_page"]) == (2, 2)
+    assert submitted["ocr_source"] == "drive"
+    pages = _pages_of(db, invoice)
+    assert [pages[n]["status"] for n in (1, 2, 3)] == ["ok", "ok", "ok"]
+    assert [pages[n]["ocr_source"] for n in (2, 3)] == ["drive", "drive"]
+    assert "Image labels: [receipt" not in pages[2]["text"]  # AC 4: the trailer is gone
+    assert "Image labels: this interior mention" in pages[2]["text"]  # ... only the trailer
+    assert "Northwind" in pages[1]["text"]  # the local read is untouched
+    document = _query(db, "SELECT ocr_source FROM document WHERE document_id = ?", (invoice,))
+    assert document[0]["ocr_source"] == "drive"
+    assert _run(db, "find", "41215")["count"] == 1  # the drive text is indexed
+    assert _run(db, "find", "northwind")["count"] == 1  # ... and the local text still is
+
+    # A re-submit is a no-op, not an error: nothing is left pending.
+    assert _run(
+        db, "ocr", "submit", "--source", "drive", "--sha256", sha,
+        "--text-file", "-", config=config, stdin=DRIVE_BLOB,
+    )["pages_marked"] == 0
+
+    # AC 5: Drive OCR is opportunistic; an empty answer must not blank the local fallback.
+    before = _pages_of(db, faint)[1]
+    empty = _run(
+        db, "ocr", "submit", "--source", "drive", "--rel-path", "archive/invoice.pdf",
+        "--text-file", "-", config=config, stdin="\n  \nImage labels: [photo]\n",
+    )
+    assert empty["empty"] is True and empty["pages_marked"] == 1
+    after = _pages_of(db, faint)[1]
+    assert (after["text"], after["confidence"], after["ocr_source"]) == (
+        before["text"], before["confidence"], before["ocr_source"]
+    )
+    assert (after["status"], after["note"]) == ("skipped", "drive_empty")
+    # ... and the page is no longer sticky, so the next run resumes strictly after `drive`.
+    _run(db, "ocr", "run", "--root", str(root), config=config)
+    assert _pages_of(db, faint)[1]["status"] == "pending_vision"
+
+    # AC 7 / Architecture section 6: the whole exchange wrote only the index.
+    assert _tree_fingerprint(root) == fingerprint
