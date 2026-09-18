@@ -87,12 +87,17 @@ confidence clears `[ocr].min_confidence`:
    pending page and the document's other pending pages are marked resolved at `drive` with their
    own text preserved. The result is document-accurate and page-approximate; the submit resolves
    its document by `--document`, `--sha256` or `--rel-path` (never by title — the same title
-   matches several Drive copies). Owning Drive auth so `ocr run` can walk the rung unattended,
-   and remote-only/drift listing, are still deferred.
+   matches several Drive copies). A drive submit also re-homes any of the document's pages still
+   sitting at the older `pending_vision` status (recorded before this rung existed) — the point
+   of the rung is to rescue those stuck pages, so they count as pending drive too. Owning Drive
+   auth so `ocr run` can walk the rung unattended, and remote-only/drift listing, are still
+   deferred.
 3. **vision** — the agent reads the page image and supplies text via `filingcabinet ocr submit`;
    the tool validates and commits with `ocr_source = 'vision'` at confidence `1.0`. Last resort,
    costs tokens; never run automatically by `ocr run` — a page needing it is left `pending_vision`
-   for the agent to close out.
+   for the agent to close out. `--page` is required for `--source vision` (omitting it, or any
+   other invalid `ocr submit` combination, now exits `1` from `cmd_ocr_submit`'s own validation
+   rather than argparse's exit `2`).
 
 Migration `005_ocr.sql` adds `page_ocr` (one row per page: `confidence`, `rung`, `ocr_source`,
 `status` — `ok | pending_drive | pending_vision | skipped | exhausted`, `note` for the
