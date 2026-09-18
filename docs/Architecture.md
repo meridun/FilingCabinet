@@ -76,20 +76,39 @@ confidence clears `[ocr].min_confidence`:
 1. **local** — PyMuPDF reads embedded text layers directly; tesseract (invoked directly, no
    ocrmypdf/Ghostscript) runs on rasterized pages, rendered into an OS temp dir. Free, private,
    batchable.
-2. **drive** — Google Drive's own text layer via the Drive API. Reserved in config, not
-   implemented; a listed-but-unimplemented rung is skipped with a recorded reason rather than
-   erroring. Deferred until a Drive-API phase exists.
+2. **drive** — Google Drive's own text layer, fetched by the *agent* through its Drive connector
+   (this repo owns no Drive auth and calls no Drive API) and committed with `filingcabinet ocr
+   submit --source drive`, which records `ocr_source = 'drive'`. Like vision it is a marker rung:
+   `ocr run` never executes it, it leaves the page `pending_drive` for the agent to close out.
+   Cheaper than vision, but opportunistic — Drive has no text for some files, and an empty
+   answer is recorded as `drive_empty` and never overwrites what the local rung read.
+   **Document-level**, unlike the rest of the ladder: the connector returns one blob per document
+   with no page boundaries and no confidence, so the blob is committed to the lowest-numbered
+   pending page and the document's other pending pages are marked resolved at `drive` with their
+   own text preserved. The result is document-accurate and page-approximate; the submit resolves
+   its document by `--document`, `--sha256` or `--rel-path` (never by title — the same title
+   matches several Drive copies). A drive submit also re-homes any of the document's pages still
+   sitting at the older `pending_vision` status (recorded before this rung existed) — the point
+   of the rung is to rescue those stuck pages, so they count as pending drive too. Owning Drive
+   auth so `ocr run` can walk the rung unattended, and remote-only/drift listing, are still
+   deferred.
 3. **vision** — the agent reads the page image and supplies text via `filingcabinet ocr submit`;
    the tool validates and commits with `ocr_source = 'vision'` at confidence `1.0`. Last resort,
    costs tokens; never run automatically by `ocr run` — a page needing it is left `pending_vision`
-   for the agent to close out.
+   for the agent to close out. `--page` is required for `--source vision` (omitting it, or any
+   other invalid `ocr submit` combination, now exits `1` from `cmd_ocr_submit`'s own validation
+   rather than argparse's exit `2`).
 
 Migration `005_ocr.sql` adds `page_ocr` (one row per page: `confidence`, `rung`, `ocr_source`,
-`status` — `ok | pending_vision | skipped | exhausted`, `note` for the machine-readable reason)
+`status` — `ok | pending_drive | pending_vision | skipped | exhausted`, `note` for the
+machine-readable reason)
 and `document_fts`, an external-content FTS5 index over `document.ocr_text` kept in sync by three
-triggers (insert/delete/update-of-`ocr_text`) that are its only writers. `document.ocr_source`
+triggers (insert/delete/update-of-`ocr_text`) that are its only writers. Those columns are plain
+`TEXT` with no `CHECK`, so a new rung adds vocabulary without a migration.
+`document.ocr_source`
 keeps the coarse `local | drive | vision` vocabulary from §2; `page_ocr.ocr_source` is the finer
-`local_text | local_tesseract | vision`. `filingcabinet find <query> [--json]` queries the index;
+`local_text | local_tesseract | drive | vision`.
+`filingcabinet find <query> [--json]` queries the index;
 `filingcabinet doctor` reports tesseract presence/version (and PyMuPDF's) without raising when
 absent.
 
@@ -100,7 +119,10 @@ last recorded (strictly advancing, terminating in `exhausted`) — except a rung
 that rung, so installing tesseract and re-running actually picks the page back up. Either way, a
 page carrying text is never blanked by a later pass that reads less (a re-escalation preserves the
 prior text/confidence/source until something better replaces it), so raising `min_confidence`
-cannot silently drop a document out of `find`. `ocr run --json` reports a `degraded` count —
+cannot silently drop a document out of `find`. One page state is *sticky* rather than resumable:
+a page left `pending_drive` is not re-walked while `drive` is still in the ladder, so a later run
+cannot escalate it past the agent before a submission arrives; dropping `drive` from the ladder
+releases it. `ocr run --json` reports a `degraded` count —
 pages currently deferred for an environment reason — alongside the status counts.
 
 ## 6. Organize (phases 5-6)

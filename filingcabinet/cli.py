@@ -430,6 +430,7 @@ def cmd_ocr_run(args: argparse.Namespace) -> int:
         args,
         payload,
         f"{root}: {summary.documents} document(s), {summary.pages} page(s) - {summary.ok} ok, "
+        f"{summary.pending_drive} pending drive, "
         f"{summary.pending_vision} pending vision, {summary.skipped} skipped, "
         f"{summary.exhausted} exhausted, {summary.degraded} degraded (toolchain), "
         f"{summary.errors} error(s)",
@@ -447,22 +448,50 @@ def _read_submitted_text(args: argparse.Namespace) -> str:
         raise SystemExit(f"error: cannot read {path}: {exc}") from exc
 
 
+def _drive_submit_text(result: dict) -> str:
+    if not result["pages_marked"]:
+        return f"document {result['document_id']}: no pending page(s); nothing committed"
+    if result["empty"]:
+        return (
+            f"document {result['document_id']}: empty drive result; kept existing text on "
+            f"{result['pages_marked']} page(s)"
+        )
+    return (
+        f"document {result['document_id']}: {result['chars']} character(s) committed as drive "
+        f"across {result['pages_marked']} page(s)"
+    )
+
+
 def cmd_ocr_submit(args: argparse.Namespace) -> int:
+    """Commit agent-supplied text: one page from the vision rung, or a document from drive."""
     db_path = _require_database(args)
     text = _read_submitted_text(args)
     conn = db.connect(db_path)
     try:
-        result = ocr_mod.submit_vision_text(conn, args.document, args.page, text)
+        document_id = ocr_mod.resolve_document(
+            conn, document_id=args.document, sha256=args.sha256, rel_path=args.rel_path
+        )
+        if args.source == "drive":
+            if args.page is not None:
+                raise ValueError(
+                    "--page is not valid with --source drive: Drive returns one text blob per "
+                    "document, with no page boundaries"
+                )
+            result = ocr_mod.submit_drive_text(conn, document_id, text)
+            text_line = _drive_submit_text(result)
+        else:
+            if args.page is None:
+                raise ValueError("--page is required with --source vision")
+            result = ocr_mod.submit_vision_text(conn, document_id, args.page, text)
+            text_line = (
+                f"document {result['document_id']} page {result['page']}: "
+                f"{result['chars']} character(s) committed as vision"
+            )
     except ValueError as exc:
         raise SystemExit(f"error: {exc}") from exc
     finally:
         conn.close()
-    _emit(
-        args,
-        {"db": str(db_path), **result},
-        f"document {result['document_id']} page {result['page']}: "
-        f"{result['chars']} character(s) committed as vision",
-    )
+    _emit(args, {"db": str(db_path), **result}, text_line)
     return 0
 
 
@@ -765,10 +794,27 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--root", help="document root (overrides FC_ROOT and config)")
     q.add_argument("--limit", type=int, help="cap the number of documents processed")
     q.set_defaults(func=cmd_ocr_run)
-    q = ocr_sub.add_parser("submit", help="commit agent-supplied text for one page (vision rung)")
-    q.add_argument("--document", type=int, required=True, help="document_id")
-    q.add_argument("--page", type=int, required=True, help="1-based page number")
-    q.add_argument("--text-file", required=True, help="file holding the page text, or - for stdin")
+    q = ocr_sub.add_parser(
+        "submit", help="commit agent-supplied text (vision page, or drive document)"
+    )
+    target = q.add_mutually_exclusive_group(required=True)
+    target.add_argument("--document", type=int, help="document_id")
+    target.add_argument("--sha256", help="document sha256 (64 hex characters)")
+    target.add_argument(
+        "--rel-path",
+        help="occurrence path under [paths].root; needs a parent directory (a bare "
+        "filename is ambiguous)",
+    )
+    q.add_argument(
+        "--page", type=int, help="1-based page number (required for --source vision)"
+    )
+    q.add_argument(
+        "--source",
+        choices=("vision", "drive"),
+        default="vision",
+        help="rung the text came from: vision is per page, drive is per document",
+    )
+    q.add_argument("--text-file", required=True, help="file holding the text, or - for stdin")
     q.set_defaults(func=cmd_ocr_submit)
 
     p = sub.add_parser("find", help="full-text search over OCR text")

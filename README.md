@@ -20,8 +20,9 @@ the logic every request.
 - **Dedup in three tiers** — exact hash, near-duplicate rescans (perceptual page hashes + OCR
   similarity), and subset detection (pages of one scan inside another). Uncertain matches go
   to a review queue.
-- **OCR ladder** — local tesseract first, Drive's text layer when the API lands, agent vision
-  as a last resort. Full-text search over the result.
+- **OCR ladder** — local tesseract first, then Drive's text layer (fetched by the agent through
+  its Drive connector and committed with `ocr submit --source drive`, document-level, no owned
+  Drive API), agent vision as a last resort. Full-text search over the result.
 - **Propose, then apply** — rules classify known vendors, the agent handles the rest, and
   `propose` writes a plan a human reviews. `apply` executes it with a move-log and `undo`.
 

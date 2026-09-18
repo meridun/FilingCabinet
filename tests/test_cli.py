@@ -1,4 +1,5 @@
 import argparse
+import io
 import json
 from pathlib import Path
 
@@ -882,3 +883,142 @@ def test_undo_text_report_says_nothing_left_to_reverse(tmp_path, monkeypatch, ca
     capsys.readouterr()
     assert cli.main(["--db", dbp, "undo", plan_id, "--root", str(root)]) == 0
     assert "nothing left to reverse" in capsys.readouterr().out
+
+
+def _document_with_pending_page(dbp, sha: str, rel_path: str) -> int:
+    """One indexed document whose only page is parked waiting for an agent."""
+    conn = db.connect(dbp)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO document (sha256, size_bytes, page_count, first_seen_at, "
+                "updated_at) VALUES (?, 1, 1, '2026-01-01', '2026-01-01')",
+                (sha,),
+            )
+            document_id = int(
+                conn.execute(
+                    "SELECT document_id FROM document WHERE sha256 = ?", (sha,)
+                ).fetchone()["document_id"]
+            )
+            conn.execute(
+                "INSERT INTO occurrence (document_id, rel_path, mtime, size_bytes, seen_at) "
+                "VALUES (?, ?, 0.0, 1, '2026-01-01')",
+                (document_id, rel_path),
+            )
+            conn.execute(
+                "INSERT INTO page_ocr (document_id, page_number, confidence, rung, status, "
+                "updated_at) VALUES (?, 1, 0.0, 'vision', 'pending_vision', '2026-01-01')",
+                (document_id,),
+            )
+        return document_id
+    finally:
+        conn.close()
+
+
+def test_ocr_submit_drive_by_sha256_from_stdin(tmp_path, capsys, monkeypatch):
+    dbp = _migrated_db(tmp_path, capsys)
+    digest = "ab" * 32
+    document_id = _document_with_pending_page(dbp, digest, "scans/bill.pdf")
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO("Drive text for the whole document\n\nImage labels: [document]\n"),
+    )
+    assert cli.main(
+        ["--db", dbp, "--json", "ocr", "submit", "--source", "drive",
+         "--sha256", digest, "--text-file", "-"]
+    ) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["document_id"] == document_id and out["ocr_source"] == "drive"
+    assert out["pages_marked"] == 1 and out["text_page"] == 1 and out["empty"] is False
+
+    assert cli.main(["--db", dbp, "--json", "find", "whole document"]) == 0
+    hits = json.loads(capsys.readouterr().out)["hits"]
+    assert [hit["document_id"] for hit in hits] == [document_id]
+
+
+def test_ocr_submit_drive_by_rel_path_text_line(tmp_path, capsys):
+    dbp = _migrated_db(tmp_path, capsys)
+    _document_with_pending_page(dbp, "cd" * 32, "scans/statement.pdf")
+    text_file = tmp_path / "drive.txt"
+    text_file.write_text("Drive statement text", encoding="utf-8")
+    assert cli.main(
+        ["--db", dbp, "ocr", "submit", "--source", "drive",
+         "--rel-path", "scans/statement.pdf", "--text-file", str(text_file)]
+    ) == 0
+    assert "committed as drive across 1 page(s)" in capsys.readouterr().out
+
+    # Nothing is pending any more: a re-submit is a reported no-op, not an error.
+    assert cli.main(
+        ["--db", dbp, "ocr", "submit", "--source", "drive",
+         "--rel-path", "scans/statement.pdf", "--text-file", str(text_file)]
+    ) == 0
+    assert "no pending page(s); nothing committed" in capsys.readouterr().out
+
+
+def test_ocr_submit_drive_rejects_page_and_ambiguous_title(tmp_path, capsys):
+    dbp = _migrated_db(tmp_path, capsys)
+    _document_with_pending_page(dbp, "ef" * 32, "scans/bill.pdf")
+    text_file = tmp_path / "drive.txt"
+    text_file.write_text("Drive text", encoding="utf-8")
+
+    with pytest.raises(SystemExit):  # drive is document-level: --page makes no sense
+        cli.main(
+            ["--db", dbp, "ocr", "submit", "--source", "drive", "--rel-path",
+             "scans/bill.pdf", "--page", "1", "--text-file", str(text_file)]
+        )
+    with pytest.raises(SystemExit):  # a bare title is ambiguous across Drive copies
+        cli.main(
+            ["--db", dbp, "ocr", "submit", "--source", "drive", "--rel-path", "bill.pdf",
+             "--text-file", str(text_file)]
+        )
+    with pytest.raises(SystemExit):  # vision is per page
+        cli.main(
+            ["--db", dbp, "ocr", "submit", "--rel-path", "scans/bill.pdf",
+             "--text-file", str(text_file)]
+        )
+    with pytest.raises(SystemExit):  # exactly one selector
+        cli.main(
+            ["--db", dbp, "ocr", "submit", "--document", "1", "--sha256", "ef" * 32,
+             "--page", "1", "--text-file", str(text_file)]
+        )
+    with pytest.raises(SystemExit):
+        cli.main(["--db", dbp, "ocr", "submit", "--page", "1", "--text-file", str(text_file)])
+
+
+def test_ocr_submit_drive_empty_result_keeps_existing_text(tmp_path, capsys):
+    dbp = _migrated_db(tmp_path, capsys)
+    document_id = _document_with_pending_page(dbp, "12" * 32, "scans/faint.pdf")
+    conn = db.connect(dbp)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE page_ocr SET text = 'weak local read', confidence = 0.535, "
+                "ocr_source = 'local_tesseract' WHERE document_id = ?",
+                (document_id,),
+            )
+    finally:
+        conn.close()
+    text_file = tmp_path / "empty.txt"
+    text_file.write_text("   \n", encoding="utf-8")
+    assert cli.main(
+        ["--db", dbp, "--json", "ocr", "submit", "--source", "drive",
+         "--document", str(document_id), "--text-file", str(text_file)]
+    ) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["empty"] is True and out["pages_marked"] == 1 and out["text_page"] is None
+
+    conn = db.connect(dbp)
+    try:
+        page = conn.execute(
+            "SELECT text, confidence, ocr_source, status, note FROM page_ocr "
+            "WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert page["text"] == "weak local read" and page["confidence"] == 0.535
+    assert (page["ocr_source"], page["status"], page["note"]) == (
+        "local_tesseract",
+        "skipped",
+        "drive_empty",
+    )

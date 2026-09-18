@@ -1,9 +1,14 @@
 """Phase 4 OCR ladder (docs/Architecture.md §5).
 
 Per-page ladder driven by `[ocr].ladder`: `local` reads the embedded PyMuPDF text layer and
-falls back to tesseract on rasterized pages; `vision` is the agent-driven last resort, marked
-here and committed later by `submit_vision_text`. `drive` is reserved for the Drive-API phase
-and is skipped with a recorded reason rather than treated as an error.
+falls back to tesseract on rasterized pages; `drive` and `vision` are both agent-driven rungs,
+marked here and committed later by `submit_drive_text` / `submit_vision_text`. An unimplemented
+rung name is still skipped with a recorded reason rather than treated as an error.
+
+The `drive` rung is document-level on the way in: the Drive connector returns one text blob per
+document with no page boundaries, so `submit_drive_text` commits the blob to the lowest-numbered
+pending page and marks the document's other pending pages resolved at the `drive` rung with
+their existing text preserved. Text is therefore document-accurate and page-approximate.
 
 A page is done when its recorded confidence reaches `[ocr].min_confidence`; a page below it
 resumes at the rung *after* the one recorded, so re-runs strictly advance and a page whose
@@ -21,6 +26,7 @@ pages report `skipped` with a note, never raises and never fails the run.
 
 from __future__ import annotations
 
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -45,14 +51,37 @@ _DENSITY_CHARS = 200
 
 STATUS_OK = "ok"
 STATUS_PENDING_VISION = "pending_vision"
+STATUS_PENDING_DRIVE = "pending_drive"
 STATUS_SKIPPED = "skipped"
 STATUS_EXHAUSTED = "exhausted"
+
+# Statuses that park a page waiting for an agent round trip rather than finishing it.
+_AGENT_PENDING = (STATUS_PENDING_VISION, STATUS_PENDING_DRIVE)
+
+# Asserted, not measured - the same convention the vision rung uses. It means "an agent
+# answered", never "the read is perfect": Drive returns no confidence score of its own.
+DRIVE_CONFIDENCE = 1.0
 
 # Notes record *why* a rung produced nothing. An availability reason (the toolchain or the rung
 # itself is missing) describes the environment, not the page, so it is retryable; a quality
 # reason (a thin or garbled read) is not - that is what the strictly-advancing resume rule is for.
 NOTE_TESSERACT_MISSING = "tesseract_missing"
 NOTE_RUNG_UNAVAILABLE = "rung_unavailable:"
+# Drive answered with nothing. A quality reason, not an availability one: Drive OCR is
+# opportunistic, so the rung is not retried and the page resumes strictly after it.
+NOTE_DRIVE_EMPTY = "drive_empty"
+
+# Drive returns image files with a trailing `Image labels: [...]` machine annotation. Anchored at
+# the end of the string, so no interior line is touched. Both quantifiers are *possessive* (`*+`,
+# Python >= 3.11) and that is load-bearing, not style: `[^\n]*` and `\s*` are adjacent over
+# overlapping classes (space, tab) in front of an anchor, so a backtracking engine retries every
+# split of a trailing whitespace run - quadratic in that run's length whenever the tail fails to
+# match (measured 3.5 s at 32k spaces, extrapolating to about an hour at the MAX_SUBMIT_CHARS
+# cap). Possessive quantifiers never give characters back, which makes the scan linear, and the
+# accepted language is unchanged: any character `[^\n]*+` keeps from `\s*+` is itself whitespace
+# that `\s*+` would have had to consume to reach `\Z` anyway.
+# `test_strip_drive_trailer_runs_linearly` enforces the property instead of asserting it.
+_DRIVE_TRAILER_RE = re.compile(r"(?:\A|\n)[ \t]*Image labels:[^\n]*+\s*+\Z")
 
 # page_ocr.ocr_source is the fine vocabulary; document.ocr_source keeps §5's coarse one.
 _COARSE_SOURCE = {
@@ -99,6 +128,7 @@ class OcrSummary:
     pages: int = 0
     ok: int = 0
     pending_vision: int = 0
+    pending_drive: int = 0
     skipped: int = 0
     exhausted: int = 0
     # Pages whose recorded reason is an unavailable rung: the operator-facing signal that the run
@@ -132,6 +162,7 @@ def _merge(a: OcrSummary, b: OcrSummary) -> OcrSummary:
         pages=a.pages + b.pages,
         ok=a.ok + b.ok,
         pending_vision=a.pending_vision + b.pending_vision,
+        pending_drive=a.pending_drive + b.pending_drive,
         skipped=a.skipped + b.skipped,
         exhausted=a.exhausted + b.exhausted,
         degraded=a.degraded + b.degraded,
@@ -297,12 +328,21 @@ def _rung_local(
     )
 
 
+def _rung_drive(page, **_kwargs) -> PageResult:
+    """A marker, never work: drive needs an agent round trip (`ocr submit --source drive`)."""
+    return PageResult(rung="drive", status=STATUS_PENDING_DRIVE)
+
+
 def _rung_vision(page, **_kwargs) -> PageResult:
     """A marker, never work: vision needs an agent round trip (`ocr submit` commits it)."""
     return PageResult(rung="vision", status=STATUS_PENDING_VISION)
 
 
-RUNGS: dict[str, Callable[..., PageResult]] = {"local": _rung_local, "vision": _rung_vision}
+RUNGS: dict[str, Callable[..., PageResult]] = {
+    "local": _rung_local,
+    "drive": _rung_drive,
+    "vision": _rung_vision,
+}
 
 
 def _row_note(row) -> str | None:
@@ -365,7 +405,8 @@ def walk_ladder(
     """Run the ladder from ``start_index`` until a rung clears the bar or the ladder is spent.
 
     Stops at the first rung whose confidence reaches `min_confidence` (`ok`) or that defers to
-    an agent (`pending_vision`). An unimplemented rung name is recorded and stepped over. When
+    an agent (`pending_drive` / `pending_vision`). An unimplemented rung name is recorded and
+    stepped over. When
     no rung remains, the best result seen is recorded as `exhausted` - unless the last rung
     reported an environment reason (`skipped` + note), which is kept so an operator can see it.
     """
@@ -391,7 +432,7 @@ def walk_ladder(
         last = result
         if _unavailable_rung(result.note) is not None:
             carry_note = result.note
-        if result.status == STATUS_PENDING_VISION:
+        if result.status in _AGENT_PENDING:
             # Carry the best read so far, so a partial local read is not lost while the page
             # waits for an agent - and carry the reason an earlier rung could not run, so a
             # missing toolchain stays visible (and retryable) on the deferred row instead of
@@ -525,7 +566,13 @@ def ocr_document(
             (document_id,),
         )
     }
-    counts = {STATUS_OK: 0, STATUS_PENDING_VISION: 0, STATUS_SKIPPED: 0, STATUS_EXHAUSTED: 0}
+    counts = {
+        STATUS_OK: 0,
+        STATUS_PENDING_VISION: 0,
+        STATUS_PENDING_DRIVE: 0,
+        STATUS_SKIPPED: 0,
+        STATUS_EXHAUSTED: 0,
+    }
     pages = 0
     degraded = 0
     with tempfile.TemporaryDirectory(prefix="fc-ocr-") as tmp:
@@ -537,6 +584,16 @@ def ocr_document(
                 start_index = _resume_index(config.ladder, row)
                 if _page_is_done(row, config.min_confidence) or start_index >= len(config.ladder):
                     continue  # done, or the ladder is spent: never retried
+                if (
+                    row is not None
+                    and row["status"] == STATUS_PENDING_DRIVE
+                    and "drive" in config.ladder
+                ):
+                    # A page parked for the Drive agent is sticky: re-walking it here would
+                    # escalate it to `pending_vision` before any submission could arrive, so the
+                    # rung would look wired up and never collect one. Dropping `drive` from the
+                    # ladder is the escape hatch (`_resume_index` then restarts the page).
+                    continue
                 result = walk_ladder(
                     page,
                     config=config,
@@ -559,6 +616,7 @@ def ocr_document(
         pages=pages,
         ok=counts[STATUS_OK],
         pending_vision=counts[STATUS_PENDING_VISION],
+        pending_drive=counts[STATUS_PENDING_DRIVE],
         skipped=counts[STATUS_SKIPPED],
         exhausted=counts[STATUS_EXHAUSTED],
         degraded=degraded,
@@ -691,3 +749,190 @@ def submit_vision_text(
         "ocr_source": "vision",
         "chars": len(text),
     }
+
+
+def strip_drive_trailer(text: str) -> str:
+    """Drop Drive's trailing `Image labels: [...]` annotation from image-file text.
+
+    Only a trailer is removed - an interior line that happens to mention `Image labels:` is
+    part of the document and is kept. Trailing whitespace goes with it. Runs linear in the
+    length of the input whether or not it matches (see `_DRIVE_TRAILER_RE`), because this is
+    the first thing untrusted third-party text meets after the raw-length cap.
+    """
+    if not isinstance(text, str):
+        raise ValueError("submitted text must be a string")
+    return _DRIVE_TRAILER_RE.sub("", text).rstrip()
+
+
+def _normalise_rel_path(rel_path: str) -> str:
+    """occurrence.rel_path shape: forward slashes, no leading `./`."""
+    cleaned = str(rel_path).replace("\\", "/").strip()
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned.lstrip("/")
+
+
+def _like_escaped(value: str) -> str:
+    """Escape a LIKE pattern's wildcards; the caller pairs this with ``ESCAPE '\\'``."""
+    for char in ("\\", "%", "_"):
+        value = value.replace(char, "\\" + char)
+    return value
+
+
+def resolve_document(
+    conn: sqlite3.Connection,
+    *,
+    document_id: int | None = None,
+    sha256: str | None = None,
+    rel_path: str | None = None,
+) -> int:
+    """The document one - and only one - of the three selectors names.
+
+    Drive's own search is by title, and a title is ambiguous (the same name appears on several
+    Drive copies and on sidecar JSONs), so a bare filename is refused outright: resolution keys
+    on the content hash or on a path with a parent directory. Every miss and every ambiguity
+    raises ValueError; this never returns a guess.
+    """
+    db.require_migrated(conn)
+    selectors = [s for s in (document_id, sha256, rel_path) if s is not None]
+    if len(selectors) != 1:
+        raise ValueError("pass exactly one of --document, --sha256, --rel-path")
+
+    if document_id is not None:
+        row = conn.execute(
+            "SELECT document_id FROM document WHERE document_id = ?", (int(document_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"no document {document_id}")
+        return int(row["document_id"])
+
+    if sha256 is not None:
+        digest = str(sha256).strip().lower()
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise ValueError("sha256 must be 64 hexadecimal characters")
+        row = conn.execute(
+            "SELECT document_id FROM document WHERE sha256 = ?", (digest,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"no document with sha256 {digest}")
+        return int(row["document_id"])
+
+    wanted = _normalise_rel_path(rel_path)
+    if not wanted:
+        raise ValueError("rel-path is empty")
+    row = conn.execute(
+        "SELECT document_id FROM occurrence WHERE rel_path = ?", (wanted,)
+    ).fetchone()
+    if row is not None:
+        return int(row["document_id"])
+    if "/" not in wanted:
+        raise ValueError(
+            f"{wanted!r} is a bare filename, which is ambiguous across Drive copies - "
+            "pass a path including its parent directory, or a sha256"
+        )
+    matches = [
+        dict(candidate)
+        for candidate in conn.execute(
+            "SELECT document_id, rel_path FROM occurrence "
+            "WHERE rel_path LIKE ? ESCAPE '\\' ORDER BY rel_path",
+            ("%/" + _like_escaped(wanted),),
+        )
+    ]
+    if not matches:
+        raise ValueError(f"no occurrence at {wanted!r}")
+    if len(matches) > 1:
+        names = ", ".join(str(match["rel_path"]) for match in matches)
+        raise ValueError(f"{wanted!r} matches {len(matches)} occurrences: {names}")
+    return int(matches[0]["document_id"])
+
+
+def _drive_target_pages(conn: sqlite3.Connection, document_id: int) -> list[int]:
+    """Pages of this document still waiting on an agent, lowest page number first.
+
+    `pending_vision` counts too: the rung exists to rescue pages the local rung already gave up
+    on, and those are recorded as pending vision on every index that predates the drive rung.
+    """
+    return [
+        int(row["page_number"])
+        for row in conn.execute(
+            "SELECT page_number FROM page_ocr WHERE document_id = ? AND status IN (?, ?) "
+            "ORDER BY page_number",
+            (document_id, STATUS_PENDING_DRIVE, STATUS_PENDING_VISION),
+        )
+    ]
+
+
+def submit_drive_text(
+    conn: sqlite3.Connection,
+    document_id: int,
+    text: str,
+    *,
+    now: str | None = None,
+) -> dict:
+    """Commit agent-supplied Drive text for a whole document at the `drive` rung.
+
+    Document-level by necessity: the Drive connector returns one blob with no page boundaries
+    and no confidence, so the blob lands on the lowest-numbered pending page and the document's
+    other pending pages are marked resolved at `drive` with their own text preserved. The text
+    is untrusted input: length-capped on the raw value, bound as a SQL parameter, never
+    interpreted as a path or a shell argument. Raises ValueError on anything invalid.
+    """
+    db.require_migrated(conn)
+    row = conn.execute(
+        "SELECT document_id FROM document WHERE document_id = ?", (document_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no document {document_id}")
+    if not isinstance(text, str):
+        raise ValueError("submitted text must be a string")
+    if len(text) > MAX_SUBMIT_CHARS:  # cap the raw input, before any stripping
+        raise ValueError(f"submitted text exceeds {MAX_SUBMIT_CHARS} characters")
+
+    cleaned = strip_drive_trailer(text)
+    empty = not cleaned.strip()
+    targets = _drive_target_pages(conn, document_id)
+    result: dict = {
+        "document_id": document_id,
+        "pages_marked": len(targets),
+        "text_page": None,
+        "ocr_source": "drive",
+        "chars": len(cleaned),
+        "empty": empty,
+    }
+    if not targets:  # nothing was waiting: a re-submit is a no-op, never an error
+        return result
+
+    stamp = now or _now()
+    if empty:
+        # A legitimate Drive answer - its OCR is opportunistic. `_keep_earlier_read` restores
+        # whatever the local rung read, so low-confidence text stays as the fallback; the status
+        # is not `pending_drive`, so the next run resumes strictly after `drive`.
+        page_result = PageResult(
+            text=None,
+            confidence=0.0,
+            rung="drive",
+            ocr_source=None,
+            status=STATUS_SKIPPED,
+            note=NOTE_DRIVE_EMPTY,
+        )
+        with conn:
+            for page_number in targets:
+                _upsert_page(conn, document_id, page_number, page_result, stamp)
+            roll_up_document(conn, document_id, stamp)
+        return result
+
+    text_page = targets[0]
+    carried = PageResult(
+        text=cleaned,
+        confidence=DRIVE_CONFIDENCE,
+        rung="drive",
+        ocr_source="drive",
+        status=STATUS_OK,
+    )
+    with conn:
+        for page_number in targets:
+            page_result = carried if page_number == text_page else replace(carried, text=None)
+            _upsert_page(conn, document_id, page_number, page_result, stamp)
+        roll_up_document(conn, document_id, stamp)
+    result["text_page"] = text_page
+    return result
