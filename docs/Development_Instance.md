@@ -130,10 +130,29 @@ it, the same as reviewing a diff before merging. Skipped entries (a file that ch
   interrupted `apply` never leaves an unlogged, hence unreversible, move — the next `ingest`
   reconciles anything left inconsistent.
 
+## Enabling the Drive OCR rung (opt-in)
+
+The `drive` rung reads Google Drive's own text layer through the Drive API. It is off unless
+`drive` is in `[ocr].ladder`; the design is in [Architecture.md](Architecture.md) §5.
+
+1. `pip install filingcabinet[drive]`.
+2. Create a desktop OAuth client in your own Google Cloud project and download its client secret
+   JSON.
+3. Run `filingcabinet ocr auth --client-secret <file>`. It stores `drive_client_secret.json` and
+   `drive_token.json` in `[paths].data_dir` and refuses a `data_dir` under `root` or
+   `snapshot_dir` (both Drive-synced). On NTFS the owner-only file mode is not enforced: keep
+   `data_dir` under your user profile.
+4. Add the temp folder (`[ocr.drive].temp_folder`, default `filingcabinet-ocr-tmp`) to
+   `[ingest].exclude`. `doctor` warns when it is missing.
+5. Add `"drive"` to `[ocr].ladder`. While the OAuth app is in Testing status the token expires
+   after 7 days: `ocr run` then reports `drive_unauthenticated` and a re-auth hint; run
+   `ocr auth` again.
+
 ## Privacy rules
 
 - Never grant an agent, script, or third-party app broad Drive or account access; scope every
-  credential to the single indexed document folder.
+  credential to the single indexed document folder. The one exception is the opt-in `drive` OCR
+  rung's OAuth token (`drive.readonly` plus `drive.file`), which lives only in `data_dir`.
 - Never commit Drive credentials, OAuth tokens, or service-account keys — the instance
   `.gitignore` blocks the common filenames, but that is a backstop, not permission.
 - No document bytes in the framework repo or the instance directory. `npm run check:docs` fails CI here on any tracked offender.
