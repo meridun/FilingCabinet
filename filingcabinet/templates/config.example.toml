@@ -33,10 +33,20 @@ plan_dir = 'C:\filingcabinet-data\plans'
 template = "{doc_date}_{party}_{doc_type}_{detail}"
 
 [ocr]
-# Ladder: local first, drive when the Drive API lands, vision (agent-driven) as last resort.
+# Ladder: local first, vision (agent-driven) as last resort. Add "drive" between them to use
+# Google Drive's own text layer: through the Drive API once `filingcabinet ocr auth` has stored
+# a token in data_dir (needs `pip install filingcabinet[drive]`), otherwise the rung reports
+# itself unavailable and the agent can still submit Drive text with `ocr submit --source drive`.
 ladder = ["local", "vision"]
 # Pages below this local-OCR mean confidence escalate to the next rung.
 min_confidence = 0.75
+
+# [ocr.drive]
+# root_folder is where [paths].root sits below My Drive ("" = My Drive itself); temp_folder is
+# the one Drive folder the rung may write: a temporary Google Doc copy per document, deleted
+# permanently right after its text is exported. Keep temp_folder in [ingest].exclude below.
+# root_folder = ""
+# temp_folder = "filingcabinet-ocr-tmp"
 
 [dedup]
 # Near-duplicate threshold on perceptual page-hash Hamming distance (lower = stricter).
@@ -48,3 +58,7 @@ phash_max_distance = 6
 # names (sync-client scratch, Office lock files, partial downloads).
 # extensions = [".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".heic", ".webp"]
 # exclude = [".*", "~$*", "*.tmp", "*.crdownload", "*.driveupload", "*.tmp.drivedownload"]
+# Setting `exclude` replaces the defaults, so restate them. With "drive" in the ladder, add the
+# drive rung's temp folder too (`doctor` warns when it is missing):
+# exclude = [".*", "~$*", "*.tmp", "*.crdownload", "*.driveupload", "*.tmp.drivedownload",
+#            "filingcabinet-ocr-tmp"]

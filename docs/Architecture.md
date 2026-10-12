@@ -7,7 +7,7 @@ Hub doc. Decisions here were fixed in the 2026-09-07 design interview; subsystem
 
 | Concern | Source of truth | Notes |
 |---|---|---|
-| Document bytes | The Drive-synced local folder (`[paths].root`) | Google Drive's client replicates it. FilingCabinet reads it and writes to it only on an approved `apply`. No Drive API in v1. |
+| Document bytes | The Drive-synced local folder (`[paths].root`) | Google Drive's client replicates it. FilingCabinet reads it and writes to it only on an approved `apply`. The Drive API is used only by the opt-in `drive` OCR rung (§5): read-only, plus one temporary copy per document in a dedicated, excluded folder. |
 | Identity and metadata | SQLite index on a non-synced local path (`[paths].data_dir`) | WAL mode. Cloud sync corrupts `-wal`/`-shm` sidecars, so only `VACUUM INTO` snapshots go to `[paths].snapshot_dir`. |
 
 **The document ID is the sha256 of the file bytes.** Filenames are derived, renameable labels.
@@ -76,22 +76,45 @@ confidence clears `[ocr].min_confidence`:
 1. **local** — PyMuPDF reads embedded text layers directly; tesseract (invoked directly, no
    ocrmypdf/Ghostscript) runs on rasterized pages, rendered into an OS temp dir. Free, private,
    batchable.
-2. **drive** — Google Drive's own text layer, fetched by the *agent* through its Drive connector
-   (this repo owns no Drive auth and calls no Drive API) and committed with `filingcabinet ocr
-   submit --source drive`, which records `ocr_source = 'drive'`. Like vision it is a marker rung:
-   `ocr run` never executes it, it leaves the page `pending_drive` for the agent to close out.
-   Cheaper than vision, but opportunistic — Drive has no text for some files, and an empty
-   answer is recorded as `drive_empty` and never overwrites what the local rung read.
-   **Document-level**, unlike the rest of the ladder: the connector returns one blob per document
-   with no page boundaries and no confidence, so the blob is committed to the lowest-numbered
-   pending page and the document's other pending pages are marked resolved at `drive` with their
-   own text preserved. The result is document-accurate and page-approximate; the submit resolves
-   its document by `--document`, `--sha256` or `--rel-path` (never by title — the same title
-   matches several Drive copies). A drive submit also re-homes any of the document's pages still
-   sitting at the older `pending_vision` status (recorded before this rung existed) — the point
-   of the rung is to rescue those stuck pages, so they count as pending drive too. Owning Drive
-   auth so `ocr run` can walk the rung unattended, and remote-only/drift listing, are still
-   deferred.
+2. **drive** — Google Drive's own text layer, opt-in by adding `"drive"` to `[ocr].ladder`
+   (never in the default). `ocr run` walks it unattended through the Drive API
+   (`filingcabinet/drive.py`, the optional `drive` extra, imported lazily) once
+   `filingcabinet ocr auth [--client-secret FILE]` has run the one-time desktop OAuth flow and
+   stored the token in `[paths].data_dir` (§9). Scopes are `drive.readonly` plus `drive.file`,
+   never wider. Drive exposes OCR text only through a Google Docs conversion, so per document the
+   rung resolves the file, copies it as a Google Doc into one dedicated folder
+   (`[ocr.drive].temp_folder`, default `filingcabinet-ocr-tmp`, at the top of My Drive), exports
+   the copy as plain text, and **permanently** deletes it — also when the export fails. The folder
+   and its copies carry an `appProperties` mark; only marked objects are ever written, deleted or
+   swept, and each `ocr run` first sweeps marked copies an earlier crash left behind. Nothing else
+   in Drive is ever written. Where `[paths].root` is itself under My Drive, Drive desktop briefly
+   syncs a stub of the copy back down, so the folder must be in `[ingest].exclude` (`doctor`
+   warns when the effective excludes miss it).
+   **File identity** is a path walk from My Drive (through `[ocr.drive].root_folder`, the Drive
+   path of `[paths].root`, `""` for My Drive itself) along the occurrence's `rel_path`, trying
+   up to five live occurrences. Every folder step must be unique, and a title hit counts only
+   when exactly one file of that name has the occurrence's `size_bytes` — the same title exists
+   in several folders — otherwise the answer is `drive_not_found`, never a guess. No Drive id is
+   persisted.
+   **Document-level**, unlike the rest of the ladder: Drive returns one blob per document with no
+   page boundaries and no confidence, so the first page of a document to reach the rung triggers
+   one fetch, the blob (with Drive's trailing `Image labels:` annotation stripped) lands on that
+   lowest pending page at a fixed `DRIVE_CONFIDENCE`, and the document's later pending pages are
+   resolved at `drive` with their own text preserved. Document-accurate, page-approximate.
+   **Notes.** Environment class — `drive_offline`, `drive_unauthenticated` (including the 7-day
+   refresh-token expiry of an OAuth app in Testing status; `ocr run` then names `filingcabinet
+   ocr auth`), `drive_quota` — counts in `degraded`, trips a per-run breaker (no further API
+   calls that run) and resumes at `drive` next run. Quality class — `drive_not_found`,
+   `drive_empty`, `drive_convert_failed`, `drive_too_long` — is not retried. Either way the page
+   lands `skipped` at the rung, never raises, and the walk continues to `vision`. Without a
+   usable session (extra missing, no `data_dir`, no client secret or token, invalid temp-folder
+   name) the rung records `rung_unavailable:drive` and resumes there once authorized.
+   **Agent fallback.** `filingcabinet ocr submit --source drive` still commits a Drive blob an
+   agent fetched through its own Drive connector — same mapping, resolved by `--document`,
+   `--sha256` or `--rel-path` (never by bare title), and it re-homes the document's
+   `pending_vision` pages — for documents the API path skips. An empty answer is recorded as
+   `drive_empty` and never overwrites what the local rung read. Remote-only and drift listing
+   are still deferred (§10).
 3. **vision** — the agent reads the page image and supplies text via `filingcabinet ocr submit`;
    the tool validates and commits with `ocr_source = 'vision'` at confidence `1.0`. Last resort,
    costs tokens; never run automatically by `ocr run` — a page needing it is left `pending_vision`
@@ -101,7 +124,8 @@ confidence clears `[ocr].min_confidence`:
 
 Migration `005_ocr.sql` adds `page_ocr` (one row per page: `confidence`, `rung`, `ocr_source`,
 `status` — `ok | pending_drive | pending_vision | skipped | exhausted`, `note` for the
-machine-readable reason)
+machine-readable reason; `ocr run` no longer produces `pending_drive`, which survives only on
+rows an older index parked for the agent)
 and `document_fts`, an external-content FTS5 index over `document.ocr_text` kept in sync by three
 triggers (insert/delete/update-of-`ocr_text`) that are its only writers. Those columns are plain
 `TEXT` with no `CHECK`, so a new rung adds vocabulary without a migration.
@@ -109,21 +133,25 @@ triggers (insert/delete/update-of-`ocr_text`) that are its only writers. Those c
 keeps the coarse `local | drive | vision` vocabulary from §2; `page_ocr.ocr_source` is the finer
 `local_text | local_tesseract | drive | vision`.
 `filingcabinet find <query> [--json]` queries the index;
-`filingcabinet doctor` reports tesseract presence/version (and PyMuPDF's) without raising when
-absent.
+`filingcabinet doctor` reports tesseract presence/version (and PyMuPDF's), and for the drive rung
+the extra's presence, client-secret and token presence, granted scope names and the temp-folder
+exclusion check — never a credential value — without raising when anything is absent.
 
 Per-page confidence is persisted so a re-run is resumable: a page already at or above
 `min_confidence` is skipped. A page below threshold normally resumes at the rung *after* the one
 last recorded (strictly advancing, terminating in `exhausted`) — except a rung that was
-*unavailable* in the environment (tesseract missing, or an unimplemented rung name) resumes *at*
-that rung, so installing tesseract and re-running actually picks the page back up. Either way, a
+*unavailable* in the environment (tesseract missing, an unimplemented rung name, no usable Drive
+session, or a Drive environment note) resumes *at* that rung, so installing tesseract or
+authorizing Drive and re-running actually picks the page back up. With `drive` in the ladder,
+pages that never got an answer from it also resume there once: a legacy `pending_drive` row,
+and a `pending_vision` row recorded past `drive` with no `drive_*` note (the backlog from before
+the rung). A page whose note records a drive answer is never re-homed. Either way, a
 page carrying text is never blanked by a later pass that reads less (a re-escalation preserves the
 prior text/confidence/source until something better replaces it), so raising `min_confidence`
-cannot silently drop a document out of `find`. One page state is *sticky* rather than resumable:
-a page left `pending_drive` is not re-walked while `drive` is still in the ladder, so a later run
-cannot escalate it past the agent before a submission arrives; dropping `drive` from the ladder
-releases it. `ocr run --json` reports a `degraded` count —
-pages currently deferred for an environment reason — alongside the status counts.
+cannot silently drop a document out of `find`. `ocr run --json` reports a `degraded` count —
+pages currently deferred for an environment reason — alongside the status counts, and, with
+`drive` in the ladder, a `drive` block (`available`, `reason`, `status`, `fetched`, `empty`,
+`failed`, `swept`, `delete_failures`, plus `hint` when re-authorization is needed).
 
 ## 6. Organize (phases 5-6)
 
@@ -356,9 +384,14 @@ to.
   Documents stay in the Drive folder; Drive is their backup. This deliberately diverges from
   pemr-data, which commits a content-addressed copy of every scan. Scaffold one with
   `filingcabinet instance init <dir>` - see [Development_Instance.md](Development_Instance.md).
-- **Secrets (any future Drive credential, token, or key):** live only in the instance directory
-  or `[paths].data_dir`, never in the framework repo, and never under `[paths].root` or
-  `[paths].snapshot_dir`, which Drive syncs.
+- **Secrets (the drive rung's OAuth client secret and token):** live only in
+  `[paths].data_dir` (`drive_client_secret.json`, `drive_token.json`), never in the framework
+  repo, never under `[paths].root` or `[paths].snapshot_dir` (Drive syncs both; `ocr auth`
+  refuses such a `data_dir`, and `doctor` warns), and never in `--json` output, logs or errors —
+  reports carry presence and scope names only. The token is written owner-only where the OS
+  honours mode bits; NTFS does not, so on Windows keep `data_dir` under your user profile or
+  restrict its ACL to your account (a `C:\filingcabinet-data` inherits ACLs other local users
+  can read).
 - **pemr:** independent. Both projects use sha256 content IDs, so a later bridge (pemr
   referencing a FilingCabinet document) is a lookup, not a dependency. No shared code or DB.
 
@@ -366,11 +399,16 @@ Security-relevant rule the OCR path (§5) upholds and any later rung (`drive`, o
 installer) must preserve: document content never reaches a shell (tesseract runs as an argv list,
 never `shell=True`, on a code-constructed path, with a timeout) and OCR never writes under
 `[paths].root` (rasterization lands in an OS temp dir) — the same read-only-on-the-tree posture
-as ingest and dedup.
+as ingest and dedup. The drive rung keeps it: it calls a library, never a CLI, writes nothing
+locally, and its one Drive-side write is the marked temporary copy in the dedicated, excluded
+folder, permanently deleted after export. Drive-returned text is untrusted like agent text:
+length-capped, bound as a SQL parameter, never a path.
 
 ## 10. Open questions
 
-- Local-to-Drive drift that has not synced down as a file needs the Drive API. Deferred.
+- Local-to-Drive drift that has not synced down as a file needs the Drive API. The credential
+  and file-identity groundwork now exists (the drive rung, §5); drift listing itself is still
+  deferred.
 - Windows OCR toolchain (tesseract) install remains manual (`doctor` reports presence/version,
   landed in phase 4; an installer or `doctor --fix` is still open). See
   [Development.md](Development.md).

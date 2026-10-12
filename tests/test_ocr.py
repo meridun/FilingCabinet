@@ -752,7 +752,8 @@ def test_resolve_document_suffix_wildcards_are_literal(conn):
 
 
 @requires_pymupdf
-def test_ladder_defers_to_drive_before_vision(conn, tmp_path, monkeypatch):
+def test_ladder_walks_drive_before_vision_without_a_session(conn, tmp_path, monkeypatch):
+    """No usable Drive session: the rung is unavailable, never a parking spot for an agent."""
     root = tmp_path / "docs"
     root.mkdir()
     _write_pdf(root / "one.pdf")
@@ -773,9 +774,13 @@ def test_ladder_defers_to_drive_before_vision(conn, tmp_path, monkeypatch):
         runner=lambda image_path: ("weak", 0.2),
         now=NOW,
     )
-    assert (summary.pending_drive, summary.pending_vision) == (1, 0)
+    assert (summary.pending_drive, summary.pending_vision, summary.degraded) == (0, 1, 1)
     page = _pages(conn, first)[0]
-    assert (page["status"], page["rung"]) == ("pending_drive", "drive")
+    assert (page["status"], page["rung"], page["note"]) == (
+        "pending_vision",
+        "vision",
+        "rung_unavailable:drive",
+    )
     assert page["text"] == "weak"  # the local read is carried, not lost
 
     # The default ladder has no drive rung: the same shape of page still defers to vision.
@@ -789,41 +794,43 @@ def test_ladder_defers_to_drive_before_vision(conn, tmp_path, monkeypatch):
         now=NOW,
     )
     assert (default_summary.pending_drive, default_summary.pending_vision) == (0, 1)
+    assert default_summary.degraded == 0
     assert _pages(conn, second)[0]["status"] == "pending_vision"
 
 
 @requires_pymupdf
-def test_pending_drive_page_is_not_escalated_by_a_rerun(conn, indexed, monkeypatch):
-    """Without the sticky rule the rung would look wired up and never collect a submission."""
+def test_legacy_pending_drive_page_resumes_at_drive(
+    conn, indexed, monkeypatch, fake_drive, drive_session
+):
+    """A page the marker rung parked for an agent is no longer sticky: it resumes at drive."""
     root, document_id = indexed
-    monkeypatch.setattr(ocr, "tesseract_version", lambda: "tesseract v5.4.0")
-    monkeypatch.setattr(ocr, "_render_page", lambda page, tmp_dir: Path(tmp_dir) / "page-1.png")
+    _add_page(conn, document_id, 1, status="pending_drive", text="weak", confidence=0.2,
+              rung="drive", ocr_source="local_tesseract")
     with_drive = ocr.OcrConfig(ladder=("local", "drive", "vision"), min_confidence=0.75)
-    ocr.run_ocr(
-        conn,
-        root,
-        config=with_drive,
-        extractor=lambda page: "",
-        runner=lambda image_path: ("weak", 0.2),
-        now=NOW,
-    )
-    assert _pages(conn, document_id)[0]["status"] == "pending_drive"
 
-    rerun = ocr.run_ocr(conn, root, config=with_drive, extractor=_never_called, now=NOW)
-    assert rerun.pages == 0
-    assert _pages(conn, document_id)[0]["status"] == "pending_drive"
-
-    # Dropping `drive` from the ladder is the escape hatch: the page restarts and defers again.
-    unstuck = ocr.run_ocr(
-        conn,
-        root,
-        config=ocr.OcrConfig(min_confidence=0.75),
-        extractor=lambda page: "",
-        runner=lambda image_path: ("weak", 0.2),
-        now=NOW,
+    # Without a session the page moves on to vision, keeps its text, and stays retryable.
+    unauthorized = ocr.run_ocr(conn, root, config=with_drive, extractor=_never_called, now=NOW)
+    assert (unauthorized.pages, unauthorized.pending_vision, unauthorized.degraded) == (1, 1, 1)
+    page = _pages(conn, document_id)[0]
+    assert (page["status"], page["note"], page["text"]) == (
+        "pending_vision",
+        "rung_unavailable:drive",
+        "weak",
     )
-    assert unstuck.pending_vision == 1
-    assert _pages(conn, document_id)[0]["status"] == "pending_vision"
+
+    # Authorized: the next run resumes at drive, not past it, and the API answers.
+    fake_drive.add_path("a.pdf", size=1, text=DRIVE_TEXT)
+    summary = ocr.run_ocr(
+        conn, root, config=with_drive, extractor=_never_called, now=NOW, drive=drive_session()
+    )
+    assert (summary.pages, summary.ok, summary.degraded) == (1, 1, 0)
+    page = _pages(conn, document_id)[0]
+    assert (page["status"], page["rung"], page["ocr_source"], page["text"]) == (
+        "ok",
+        "drive",
+        "drive",
+        DRIVE_TEXT,
+    )
 
 
 @requires_pymupdf
@@ -847,3 +854,274 @@ def test_submit_drive_empty_then_run_falls_through_to_vision(conn, indexed, monk
     assert summary.pending_vision == 1  # resumes strictly after `drive`, never retrying it
     page = _pages(conn, document_id)[0]
     assert (page["status"], page["rung"], page["text"]) == ("pending_vision", "vision", "weak")
+
+
+# --- the unattended drive rung (Drive API through a fake client) ------------------------------
+
+DRIVE_LADDER = ocr.OcrConfig(ladder=("local", "drive", "vision"), min_confidence=0.75)
+
+
+def _weak_local(monkeypatch):
+    """Every page reads below the bar locally, with a little text to carry."""
+    monkeypatch.setattr(ocr, "tesseract_version", lambda: "tesseract v5.4.0")
+    monkeypatch.setattr(ocr, "_render_page", lambda page, tmp_dir: Path(tmp_dir) / "page.png")
+
+
+def _three_page_document(conn, tmp_path):
+    root = tmp_path / "docs"
+    (root / "scans").mkdir(parents=True)
+    _write_pdf(root / "scans" / "three.pdf", pages=3)
+    document_id = _add_document(conn, "sha-three", page_count=3)
+    _add_occurrence(conn, document_id, "scans/three.pdf")
+    return root, document_id
+
+
+@requires_pymupdf
+def test_drive_rung_commits_api_text_document_level(
+    conn, tmp_path, monkeypatch, fake_drive, drive_session
+):
+    root, document_id = _three_page_document(conn, tmp_path)
+    _weak_local(monkeypatch)
+    fake_drive.add_path("scans/three.pdf", size=1, text=DRIVE_TEXT + "\n\nImage labels: [paper]\n")
+
+    summary = ocr.run_ocr(
+        conn,
+        root,
+        config=DRIVE_LADDER,
+        extractor=lambda page: CLEAN_TEXT if page.number == 0 else "",
+        runner=lambda image_path: (f"weak {image_path.name}", 0.2),
+        now=NOW,
+        drive=drive_session(),
+    )
+    assert (summary.pages, summary.ok, summary.pending_vision, summary.degraded) == (3, 3, 0, 0)
+    pages = _pages(conn, document_id)
+    assert (pages[0]["rung"], pages[0]["text"]) == ("local", CLEAN_TEXT)
+    # The blob lands on the lowest page that reached the rung, trailer stripped.
+    assert (pages[1]["status"], pages[1]["rung"], pages[1]["ocr_source"]) == (
+        "ok",
+        "drive",
+        "drive",
+    )
+    assert pages[1]["text"] == DRIVE_TEXT
+    assert pages[1]["confidence"] == ocr.DRIVE_CONFIDENCE
+    # The other pending page is resolved at drive and keeps its own read.
+    assert (pages[2]["status"], pages[2]["rung"], pages[2]["text"]) == (
+        "ok",
+        "drive",
+        "weak page.png",
+    )
+    assert len(fake_drive.called("copy_as_doc")) == 1  # one fetch per document, not per page
+    stored = conn.execute(
+        "SELECT ocr_source FROM document WHERE document_id = ?", (document_id,)
+    ).fetchone()
+    assert stored["ocr_source"] == "drive"
+    assert search.find(conn, "NW-2026-014") and search.find(conn, "Northwind")
+
+
+@requires_pymupdf
+@pytest.mark.parametrize(
+    "setup, note, environment",
+    [
+        (lambda fake: fake.errors.__setitem__("children", "drive_offline"), "drive_offline", True),
+        (
+            lambda fake: fake.errors.__setitem__("children", "drive_unauthenticated"),
+            "drive_unauthenticated",
+            True,
+        ),
+        (lambda fake: fake.errors.__setitem__("copy_as_doc", "drive_quota"), "drive_quota", True),
+        (lambda fake: fake.nodes.clear(), "drive_not_found", False),
+        (lambda fake: fake.texts.update({k: "  \n" for k in fake.texts}), "drive_empty", False),
+        (
+            lambda fake: fake.errors.__setitem__("export_text", "drive_convert_failed"),
+            "drive_convert_failed",
+            False,
+        ),
+    ],
+)
+def test_each_drive_failure_lands_skipped_and_walks_on(
+    conn, indexed, monkeypatch, fake_drive, drive_session, setup, note, environment
+):
+    root, document_id = indexed
+    _weak_local(monkeypatch)
+    fake_drive.add_path("a.pdf", size=1, text=DRIVE_TEXT)
+    setup(fake_drive)
+    summary = ocr.run_ocr(
+        conn,
+        root,
+        config=DRIVE_LADDER,
+        extractor=lambda page: "",
+        runner=lambda image_path: ("weak", 0.2),
+        now=NOW,
+        drive=drive_session(),
+    )
+    assert summary.errors == 0 and summary.pending_vision == 1  # the walk went on to vision
+    assert summary.degraded == (1 if environment else 0)
+    page = _pages(conn, document_id)[0]
+    assert (page["status"], page["note"], page["text"]) == ("pending_vision", note, "weak")
+
+    # Environment failures resume at drive; quality failures are never re-fetched.
+    fake_drive.errors.clear()
+    calls = len(fake_drive.calls)
+    rerun = ocr.run_ocr(
+        conn, root, config=DRIVE_LADDER, extractor=_never_called, now=NOW, drive=drive_session()
+    )
+    page = _pages(conn, document_id)[0]
+    if environment:
+        assert (rerun.pages, rerun.ok) == (1, 1)
+        assert (page["status"], page["ocr_source"], page["text"]) == ("ok", "drive", DRIVE_TEXT)
+    else:
+        assert rerun.pages == 0
+        assert not [c for c in fake_drive.calls[calls:] if c[0] in ("children", "copy_as_doc")]
+        assert page["note"] == note
+
+
+@requires_pymupdf
+def test_no_session_is_unavailable_and_resumes_once_authorized(
+    conn, indexed, monkeypatch, fake_drive, drive_session
+):
+    root, document_id = indexed
+    _weak_local(monkeypatch)
+    first = ocr.run_ocr(
+        conn,
+        root,
+        config=DRIVE_LADDER,
+        extractor=lambda page: "",
+        runner=lambda image_path: ("weak", 0.2),
+        now=NOW,
+        drive=ocr.drive_mod.DriveSession(ocr.drive_mod.DriveConfig(), reason="token_missing"),
+    )
+    assert first.degraded == 1
+    assert _pages(conn, document_id)[0]["note"] == "rung_unavailable:drive"
+
+    fake_drive.add_path("a.pdf", size=1, text=DRIVE_TEXT)
+    second = ocr.run_ocr(
+        conn, root, config=DRIVE_LADDER, extractor=_never_called, now=NOW, drive=drive_session()
+    )
+    assert (second.ok, second.degraded) == (1, 0)
+    assert _pages(conn, document_id)[0]["text"] == DRIVE_TEXT
+
+
+@requires_pymupdf
+def test_legacy_pending_vision_backlog_is_rehomed_once(
+    conn, indexed, fake_drive, drive_session
+):
+    root, document_id = indexed
+    _add_page(conn, document_id, 1, status="pending_vision", text="earlier read",
+              confidence=0.4, rung="vision", ocr_source="local_tesseract")
+
+    first = ocr.run_ocr(
+        conn, root, config=DRIVE_LADDER, extractor=_never_called, now=NOW, drive=drive_session()
+    )
+    assert first.pages == 1  # re-homed to drive: no drive attempt was on record
+    page = _pages(conn, document_id)[0]
+    assert (page["status"], page["note"], page["text"]) == (
+        "pending_vision",
+        "drive_not_found",
+        "earlier read",
+    )
+    assert page["confidence"] == 0.4 and page["ocr_source"] == "local_tesseract"
+
+    calls = len(fake_drive.calls)
+    second = ocr.run_ocr(
+        conn, root, config=DRIVE_LADDER, extractor=_never_called, now=NOW, drive=drive_session()
+    )
+    assert second.pages == 0
+    assert not [c for c in fake_drive.calls[calls:] if c[0] == "children"]
+
+
+@requires_pymupdf
+def test_drive_answer_never_blanks_earlier_text(conn, indexed, fake_drive, drive_session):
+    root, document_id = indexed
+    _add_page(conn, document_id, 1, status="pending_vision", text="earlier read",
+              confidence=0.4, rung="vision", ocr_source="local_tesseract")
+    fake_drive.add_path("a.pdf", size=1, text="\nImage labels: [blank page]\n")
+    ocr.run_ocr(
+        conn, root, config=DRIVE_LADDER, extractor=_never_called, now=NOW, drive=drive_session()
+    )
+    page = _pages(conn, document_id)[0]
+    assert (page["note"], page["text"], page["confidence"]) == ("drive_empty", "earlier read", 0.4)
+
+
+@requires_pymupdf
+def test_drive_text_over_the_cap_is_refused(
+    conn, indexed, monkeypatch, fake_drive, drive_session
+):
+    root, document_id = indexed
+    _weak_local(monkeypatch)
+    monkeypatch.setattr(ocr, "MAX_SUBMIT_CHARS", 16)
+    fake_drive.add_path("a.pdf", size=1, text="x" * 17)
+    ocr.run_ocr(
+        conn,
+        root,
+        config=DRIVE_LADDER,
+        extractor=lambda page: "",
+        runner=lambda image_path: ("weak", 0.2),
+        now=NOW,
+        drive=drive_session(),
+    )
+    page = _pages(conn, document_id)[0]
+    assert (page["note"], page["text"]) == ("drive_too_long", "weak")
+
+
+@requires_pymupdf
+def test_drive_text_is_never_interpreted_as_sql(conn, indexed, fake_drive, drive_session):
+    root, document_id = indexed
+    hostile = "'); DROP TABLE page_ocr; -- " + CLEAN_TEXT
+    fake_drive.add_path("a.pdf", size=1, text=hostile)
+    _add_page(conn, document_id, 1, status="pending_drive", rung="drive")
+    ocr.run_ocr(
+        conn, root, config=DRIVE_LADDER, extractor=_never_called, now=NOW, drive=drive_session()
+    )
+    assert _pages(conn, document_id)[0]["text"] == hostile
+
+
+@requires_pymupdf
+def test_drive_only_ladder_keeps_the_local_read_on_a_failure(
+    conn, indexed, monkeypatch, drive_session
+):
+    """With no rung after drive, the skipped drive row still carries the page's local read."""
+    root, document_id = indexed
+    _weak_local(monkeypatch)
+    ocr.run_ocr(
+        conn,
+        root,
+        config=ocr.OcrConfig(ladder=("local", "drive"), min_confidence=0.75),
+        extractor=lambda page: "",
+        runner=lambda image_path: ("weak", 0.2),
+        now=NOW,
+        drive=drive_session(),
+    )
+    page = _pages(conn, document_id)[0]
+    assert (page["status"], page["rung"], page["note"], page["text"]) == (
+        "skipped",
+        "drive",
+        "drive_not_found",
+        "weak",
+    )
+
+
+@requires_pymupdf
+def test_run_sweeps_stray_copies_before_new_work(conn, indexed, fake_drive, drive_session):
+    root, document_id = indexed
+    folder = fake_drive.add_folder("root", "filingcabinet-ocr-tmp", mark="ocr-tmp-folder")
+    stray = fake_drive.add_file(folder, "fc-ocr-crashed", mark="ocr-copy")
+    fake_drive.add_path("a.pdf", size=1, text=DRIVE_TEXT)
+    _add_page(conn, document_id, 1, status="pending_vision", rung="vision")
+    session = drive_session()
+    ocr.run_ocr(conn, root, config=DRIVE_LADDER, extractor=_never_called, now=NOW, drive=session)
+    methods = [call[0] for call in fake_drive.calls]
+    assert ("delete", stray) in fake_drive.calls
+    assert methods.index("delete") < methods.index("children")  # swept before new work
+    assert session.swept == 1 and stray not in fake_drive.nodes
+    assert _pages(conn, document_id)[0]["text"] == DRIVE_TEXT
+
+
+@requires_pymupdf
+def test_no_drive_in_the_ladder_opens_nothing(conn, indexed, fake_drive, drive_session):
+    root, _document_id = indexed
+    fake_drive.add_file("root", "stray", mark="ocr-copy")
+    ocr.run_ocr(
+        conn, root, config=ocr.OcrConfig(ladder=("local",)), extractor=lambda page: CLEAN_TEXT,
+        runner=_never_called, now=NOW, drive=drive_session(),
+    )
+    assert fake_drive.calls == []

@@ -188,8 +188,9 @@ DRIVE_BLOB = (
 def test_drive_rung_smoke_end_to_end(tmp_path):
     """Issue #9's acceptance criteria, walked through the real CLI over a real tree.
 
-    The gating real run for the agent-driven `drive` rung: a ladder that parks pages at
-    `pending_drive` instead of `pending_vision`, a document-level submit resolved by sha256,
+    The gating real run for the agent-submit path of the `drive` rung: a ladder with `drive`
+    but no Drive authorization (the rung reports itself unavailable and the pages stay
+    retryable), a document-level submit resolved by sha256,
     the `Image labels:` trailer stripped, an empty Drive answer leaving the local read as the
     fallback, and the document tree untouched throughout (``docs/Architecture.md`` section 6).
     """
@@ -222,23 +223,27 @@ def test_drive_rung_smoke_end_to_end(tmp_path):
     faint = _document_id_of(db, "archive/invoice.pdf")
     sha = _query(db, "SELECT sha256 FROM document WHERE document_id = ?", (invoice,))[0]["sha256"]
 
-    # AC 3: with `drive` before `vision`, deferred pages park at `pending_drive`.
+    # With `drive` before `vision` but no Drive authorization (no data_dir here), the rung is
+    # unavailable: deferred pages move on to `pending_vision` carrying the reason, count as
+    # degraded, and stay open to the agent's `--source drive` submit below.
     first = _run(db, "ocr", "run", "--root", str(root), config=config)
-    assert first["errors"] == 0 and first["pending_vision"] == 0
-    assert first["pending_drive"] == 3  # two blank invoice pages + the faint receipt
-    assert first["pages"] == first["ok"] + first["pending_drive"] + first["skipped"] + \
+    assert first["errors"] == 0 and first["pending_drive"] == 0
+    assert first["pending_vision"] == 3  # two blank invoice pages + the faint receipt
+    assert first["degraded"] == 3 and first["drive"]["available"] is False
+    assert first["pages"] == first["ok"] + first["pending_vision"] + first["skipped"] + \
         first["exhausted"]
     pages = _pages_of(db, invoice)
     assert pages[1]["status"] == "ok"  # the text layer finished at the local rung
-    assert [pages[2]["status"], pages[3]["status"]] == ["pending_drive", "pending_drive"]
+    assert [pages[n]["note"] for n in (2, 3)] == ["rung_unavailable:drive"] * 2
     # The thin local read is carried onto the deferred row rather than blanked.
     carried = _pages_of(db, faint)[1]
-    assert carried["status"] == "pending_drive" and (carried["text"] or "").strip()
+    assert carried["status"] == "pending_vision" and (carried["text"] or "").strip()
+    assert carried["note"] == "rung_unavailable:drive"
 
-    # AC 3: a page waiting for the agent is sticky - a re-run must not escalate it to vision.
-    _run(db, "ocr", "run", "--root", str(root), config=config)
-    assert _pages_of(db, invoice)[2]["status"] == "pending_drive"
-    assert _pages_of(db, faint)[1]["status"] == "pending_drive"
+    # A re-run retries the unavailable rung rather than writing the pages off, and keeps the read.
+    again = _run(db, "ocr", "run", "--root", str(root), config=config)
+    assert (again["pages"], again["degraded"]) == (3, 3)
+    assert _pages_of(db, faint)[1]["text"] == carried["text"]
 
     # AC 2: a bare filename is a title, and a title is ambiguous - never silently matched.
     refused = _cli(

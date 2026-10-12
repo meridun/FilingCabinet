@@ -20,9 +20,10 @@ the logic every request.
 - **Dedup in three tiers** — exact hash, near-duplicate rescans (perceptual page hashes + OCR
   similarity), and subset detection (pages of one scan inside another). Uncertain matches go
   to a review queue.
-- **OCR ladder** — local tesseract first, then Drive's text layer (fetched by the agent through
-  its Drive connector and committed with `ocr submit --source drive`, document-level, no owned
-  Drive API), agent vision as a last resort. Full-text search over the result.
+- **OCR ladder** — local tesseract first, then Drive's text layer (opt-in: fetched unattended
+  through the Drive API once `ocr auth` has stored a token in `data_dir`, or submitted by an
+  agent with `ocr submit --source drive`; document-level), agent vision as a last resort.
+  Full-text search over the result.
 - **Propose, then apply** — rules classify known vendors, the agent handles the rest, and
   `propose` writes a plan a human reviews. `apply` executes it with a move-log and `undo`.
 
@@ -33,7 +34,7 @@ Full design in [docs/Architecture.md](docs/Architecture.md); setup in
 
 | Area | Choice |
 |---|---|
-| Bytes | Drive-synced local folder; Drive client replicates. No Drive API in v1. |
+| Bytes | Drive-synced local folder; Drive client replicates. Drive API only for the opt-in OCR rung. |
 | Identity / metadata | SQLite on a non-synced local path; `VACUUM INTO` snapshots sync. |
 | Document ID | sha256 of file bytes; filenames are derived labels. |
 | Organize | Index + propose; human confirms; `apply` explicit, logged, reversible. |

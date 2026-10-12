@@ -17,6 +17,11 @@ exports/
 plans/
 config.toml
 
+# Drive rung credentials belong in [paths].data_dir only - a backstop if one lands here.
+drive_client_secret.json
+drive_token.json
+client_secret*.json
+
 # SQLite database + WAL sidecars (any name, anywhere)
 *.db
 *.sqlite
