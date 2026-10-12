@@ -13,9 +13,9 @@ Required:
 
 | Key | Value | Meaning |
 |---|---|---|
-| `BINDING` | `gh-issue` | which `bindings/<name>/BINDING.md` is bound (`gh-issue` here; `ado-feature` · `ado-pbi` live upstream in agentic-sdlc and are not carried in this repo) |
+| `BINDING` | `gh-issue` | which `bindings/<name>/BINDING.md` is bound (`gh-issue` here; `ado-feature` · `ado-pbi` live upstream in model-repo and are not carried in this repo) |
 | `SDLC_CLI` | `node sdlc/bindings/gh-issue/sdlc.mjs` | the binding's deterministic core invocation, or `none` (`sdlc …` in any prompt means this) |
-| `SPEC_VERSION` | `34b769e` | framework git tag (or sha) this profile tracks — see the pin in `docs/Development_AgenticSDLC.md` |
+| `SPEC_VERSION` | `model-repo@21c127c` | model-repo tag (or sha) this profile tracks — see the pin in `docs/Development_AgenticSDLC.md` |
 | `PROJECT` | FilingCabinet | project name (every worker's opening line) |
 | `REPO_PATH` | `C:\Claude\FilingCabinet` | local working directory the scheduled agent runs in |
 | `WORKER_AGENT` | `sdlc-worker` | the isolated worker agent's `subagent_type` name — `.github/agents/sdlc-worker.agent.md` here; rename project-scoped (e.g. `acme-sdlc-worker`) on adoption |
@@ -56,7 +56,9 @@ Optional — an unbound key means the lane step it gates is **skipped, not impro
 - **VP4 dispatcher:** trigger *(scheduled task / cron / CI / interactive)*, machine-lock
   representation *(`.git/sdlc-maint.lock` mkdir + 30-min rename reap)*, worker isolation
   *(issue-scoped worktrees at `<WORKTREE_ROOT>/<issue#>`)*, per-lane model tiers if they differ
-  from `dispatch.md`'s table.
+  from `dispatch.md`'s table, focused dispatch *(`focus.md` on request)*, shared
+  dependency install *(per-worktree; the Node side is zero-dependency, so Step 0a's
+  `node-modules` refresh is a no-op here)*.
 - **VP5 quality bars:** the commands above; which lint gate form (`clean` vs ratchet); known env
   limits; per-repo bars if multi-repo.
 - **Deterministic core:** `<SDLC_CLI>` and which operations it owns *(or `none`)*.
@@ -73,7 +75,6 @@ List each with why. Undeclared divergence is drift; declared divergence is legit
 - Doc pointers in the core and binding files point at `docs/Development_*` and `.github/` paths
   instead of upstream's `docs/*.md` / `agents/` / `skills/`. Why: this repo's doc-tier layout.
 - `bindings/ado-feature` and `bindings/ado-pbi` are not carried. Why: no Azure DevOps downstream
-  yet; copy them from upstream when one appears.
-
+  yet; copy them from model-repo when one appears.
 - `sdlc/tools/` lint ratchet is not bound (`LINT_CMD` unbound). Why: ESLint-only tooling on a Python repo.
 - `PROD_BRANCH` is `master`, not `main`. Why: house convention (matches IsekaiOnline).

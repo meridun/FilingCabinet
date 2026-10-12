@@ -52,15 +52,16 @@ is a GitHub issue.
 
 Adoption record for [meridun/model-repo](https://github.com/meridun/model-repo) components (see
 `.github/skills/fc-upstream-sync/SKILL.md`). Created from the template at model-repo **72ceda9**
-(2026-09-07). Declined rows are deliberate and revisitable.
+(2026-09-07); last synced against **21c127c** (2026-09-30) on 2026-10-12. Declined rows are
+deliberate and revisitable.
 
 | Component | Status | Pin | Notes |
 |---|---|---|---|
-| Doc-tier system (L1/L2/L3) | adopted | 72ceda9 | prefix `fc-`; L1 trimmed per pemr: no `## Tone`, graphify and Token wrappers are pointers |
-| Config sync + meta-drift guard | adopted | 72ceda9 | `fc-wt` worktree prefix allowlisted in `check-meta-drift.mjs` |
-| Caveman mode hook | adopted | 72ceda9 | L1 canonical; hook drift-checked |
-| graphify nudge hook + vtk notes | adopted | 72ceda9 | vtk in transparent-wrapper mode |
-| Role-based model routing | adopted | 72ceda9 | pin in `docs/Development_ModelRouting.md` |
-| Agentic SDLC pipeline | partial | 72ceda9 | core + `gh-issue` binding + CLI adopted; `sdlc/tools/` lint ratchet **declined** (ESLint-only, Python repo); ADO bindings declined; `PROD_BRANCH = master` |
-| Upstream sync procedure | adopted | 72ceda9 | `fc-upstream-sync` |
+| Doc-tier system (L1/L2/L3) | adopted | 21c127c | prefix `fc-`; L1 trimmed per pemr: no `## Tone`, graphify and Token wrappers are pointers; doc-issue-refs guard adopted 2026-10-12 (`superseded` label created) |
+| Config sync + meta-drift guard | adopted | 21c127c | `fc-wt` worktree prefix allowlisted in `check-meta-drift.mjs` |
+| Caveman mode hook | adopted | 21c127c | L1 canonical; hook drift-checked |
+| graphify nudge hook + vtk notes | adopted | 21c127c | vtk in transparent-wrapper mode |
+| Role-based model routing | adopted | 21c127c | pin in `docs/Development_ModelRouting.md` |
+| Agentic SDLC pipeline | partial | 21c127c | core + `gh-issue` binding + CLI adopted, including focused dispatch (`focus.md`), bounce summary, prior-work check, and the `node-modules` refresh (no-op here); `sdlc/tools/` lint ratchet **declined** 2026-10-12 again (no Python lint backlog tracked; `LINT_CMD` unbound); ADO bindings **declined** 2026-10-12 again (no Azure DevOps downstream); `PROD_BRANCH = master` |
+| Upstream sync procedure | adopted | 21c127c | `fc-upstream-sync` |
 | pemr `check:pii` roster guard | declined | — | replaced by `check:docs` (document/database file guard); no synthetic-identity roster needed here |
