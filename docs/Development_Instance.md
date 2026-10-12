@@ -1,15 +1,15 @@
-# The instance repo
+# The instance directory
 
 FilingCabinet is split in two (see [Architecture.md](Architecture.md) §8):
 
-| Framework repo (this one) | Instance repo/directory (yours, private) |
+| Framework repo (this one) | Instance directory (yours, private, optionally a git repo) |
 |---|---|
 | engine, CLI, migrations, tests, docs | `config.toml` for your machine |
 | public-capable | taxonomy and naming rules |
 | **never** holds user data | index snapshots (`snapshot_dir` exports) |
 | `.gitignore` + `npm run check:docs` enforce that | the move-log export |
 
-Documents themselves live in the Drive-synced folder and are never copied into either repo —
+Documents themselves live in the Drive-synced folder and are never copied into the framework repo or the instance directory —
 Drive is their backup. This deliberately diverges from `pemr-data`, which commits a
 content-addressed copy of every scan.
 
@@ -136,6 +136,6 @@ it, the same as reviewing a diff before merging. Skipped entries (a file that ch
   credential to the single indexed document folder.
 - Never commit Drive credentials, OAuth tokens, or service-account keys — the instance
   `.gitignore` blocks the common filenames, but that is a backstop, not permission.
-- No document bytes in either repo. `npm run check:docs` fails CI here on any tracked offender.
+- No document bytes in the framework repo or the instance directory. `npm run check:docs` fails CI here on any tracked offender.
 
 See also [Development.md](Development.md) for local setup and test commands.

@@ -350,11 +350,15 @@ to.
 
 - **Framework repo (this one):** public-capable. `.gitignore` blocks document formats and
   databases; `npm run check:docs` fails CI on any tracked offender.
-- **Instance repo (per user, private):** `config.toml`, taxonomy and rules, index snapshots,
-  the move-log export. Documents stay in the Drive folder; Drive is their backup. This
-  deliberately diverges from pemr-data, which commits a content-addressed copy of every scan.
-  Scaffold one with `filingcabinet instance init <dir>` - see
-  [Development_Instance.md](Development_Instance.md).
+- **Instance directory (per user, private, optionally a git repo):** `config.toml`, taxonomy
+  and rules, index snapshots, the move-log export. It is a plain local directory; `instance init`
+  runs no `git init`, and nothing in it is committed anywhere unless the user chooses to.
+  Documents stay in the Drive folder; Drive is their backup. This deliberately diverges from
+  pemr-data, which commits a content-addressed copy of every scan. Scaffold one with
+  `filingcabinet instance init <dir>` - see [Development_Instance.md](Development_Instance.md).
+- **Secrets (any future Drive credential, token, or key):** live only in the instance directory
+  or `[paths].data_dir`, never in the framework repo, and never under `[paths].root` or
+  `[paths].snapshot_dir`, which Drive syncs.
 - **pemr:** independent. Both projects use sha256 content IDs, so a later bridge (pemr
   referencing a FilingCabinet document) is a lookup, not a dependency. No shared code or DB.
 
