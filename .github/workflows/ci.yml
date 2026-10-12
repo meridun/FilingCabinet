@@ -27,4 +27,8 @@ jobs:
       - run: npm run check:meta-drift
       # Framework-only repo: fail before a user document or database lands in it.
       - run: npm run check:docs
+      # Docs must not cite a `superseded` issue without its superseder (docs/Documentation.md).
+      - run: npm run check:doc-issue-refs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: npm test

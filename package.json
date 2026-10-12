@@ -9,6 +9,7 @@
     "sync:claude-config:check": "node scripts/sync-claude-config.mjs --check",
     "check:meta-drift": "node scripts/check-meta-drift.mjs",
     "check:docs": "node scripts/check-docs.mjs",
+    "check:doc-issue-refs": "node scripts/check-doc-issue-refs.mjs",
     "sdlc": "node sdlc/bindings/gh-issue/sdlc.mjs",
     "test": "node --test \"test/*.test.mjs\""
   }
