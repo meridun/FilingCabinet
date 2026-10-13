@@ -16,6 +16,14 @@ ocr = ["PyMuPDF>=1.24.3"]
 dedup = ["PyMuPDF>=1.24.3", "ImageHash>=4.3", "Pillow>=10"]
 # Phase 7 MCP wrapper. The engine and CLI need none of it.
 mcp = ["mcp>=1.0"]
+# The unattended `drive` OCR rung (Google Drive API, desktop OAuth). Imported lazily; without it
+# the rung reports itself unavailable and `ocr submit --source drive` remains the fallback.
+drive = [
+    "google-api-python-client>=2.100",
+    "google-auth>=2.23",
+    "google-auth-httplib2>=0.1",
+    "google-auth-oauthlib>=1.1",
+]
 
 [project.scripts]
 filingcabinet = "filingcabinet.cli:main"

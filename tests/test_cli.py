@@ -1022,3 +1022,181 @@ def test_ocr_submit_drive_empty_result_keeps_existing_text(tmp_path, capsys):
         "skipped",
         "drive_empty",
     )
+
+
+# --- the unattended drive rung: `ocr auth`, `ocr run`'s drive block, `doctor` -----------------
+
+DRIVE_SECRET = "planted-secret-cli-zz9"
+
+
+def _drive_instance(tmp_path, *, ladder='["local", "drive", "vision"]', extra=""):
+    """A config with a local data_dir, a root, and the drive rung in the ladder."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    root = _make_root(tmp_path)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        f"[paths]\ndata_dir = '{data_dir.as_posix()}'\nroot = '{root.as_posix()}'\n"
+        f"snapshot_dir = '{(tmp_path / 'snapshots').as_posix()}'\n\n"
+        f"[ocr]\nladder = {ladder}\n{extra}",
+        encoding="utf-8",
+    )
+    return cfg, data_dir, root
+
+
+def _plant_credentials(data_dir, *, token=True):
+    from filingcabinet import drive
+
+    (data_dir / drive.CLIENT_SECRET_FILENAME).write_text(
+        json.dumps({"installed": {"client_secret": DRIVE_SECRET}}), encoding="utf-8"
+    )
+    if token:
+        (data_dir / drive.TOKEN_FILENAME).write_text(
+            json.dumps({"refresh_token": DRIVE_SECRET, "scopes": list(drive.SCOPES)}),
+            encoding="utf-8",
+        )
+
+
+def test_ocr_auth_writes_the_token_to_data_dir(tmp_path, capsys, monkeypatch):
+    from filingcabinet import drive
+
+    monkeypatch.delenv("FC_ROOT", raising=False)
+    monkeypatch.delenv("FC_SNAPSHOT_DIR", raising=False)
+    cfg, data_dir, _root = _drive_instance(tmp_path)
+    supplied = tmp_path / "client.json"
+    supplied.write_text(json.dumps({"installed": {"client_secret": DRIVE_SECRET}}))
+
+    class Creds:
+        scopes = list(drive.SCOPES)
+
+        def to_json(self):
+            return json.dumps({"refresh_token": DRIVE_SECRET})
+
+    monkeypatch.setattr(drive, "_run_installed_app_flow", lambda path, scopes: Creds())
+    assert cli.main(
+        ["--config", str(cfg), "--json", "ocr", "auth", "--client-secret", str(supplied)]
+    ) == 0
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert out == {
+        "token_path": str(data_dir / drive.TOKEN_FILENAME),
+        "scopes": ["drive.file", "drive.readonly"],
+    }
+    assert DRIVE_SECRET not in captured.out + captured.err
+    assert (data_dir / drive.TOKEN_FILENAME).is_file()
+
+
+def test_ocr_auth_refuses_without_data_dir_or_under_a_synced_dir(tmp_path, monkeypatch):
+    from filingcabinet import drive
+
+    monkeypatch.delenv("FC_ROOT", raising=False)
+    monkeypatch.delenv("FC_SNAPSHOT_DIR", raising=False)
+    monkeypatch.setattr(
+        drive, "_run_installed_app_flow", lambda *a: pytest.fail("the flow must not start")
+    )
+    bare = tmp_path / "bare.toml"
+    bare.write_text("[paths]\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="data_dir"):
+        cli.main(["--config", str(bare), "ocr", "auth"])
+
+    root = tmp_path / "Drive"
+    root.mkdir()
+    synced = tmp_path / "synced.toml"
+    synced.write_text(
+        f"[paths]\nroot = '{root.as_posix()}'\n"
+        f"data_dir = '{(tmp_path / 'drive' / 'fc-data').as_posix()}'\n",  # differs only in case
+        encoding="utf-8",
+    )
+    supplied = tmp_path / "client.json"
+    supplied.write_text("{}")
+    with pytest.raises(SystemExit, match="Drive syncs"):
+        cli.main(["--config", str(synced), "ocr", "auth", "--client-secret", str(supplied)])
+    assert not (tmp_path / "drive" / "fc-data").exists()
+
+
+def test_ocr_run_reports_the_drive_block_and_the_auth_hint(tmp_path, capsys, monkeypatch):
+    from filingcabinet import drive
+
+    cfg, data_dir, root = _drive_instance(tmp_path)
+    dbp = _migrated_db(tmp_path, capsys)
+    _plant_credentials(data_dir, token=False)
+    monkeypatch.setattr(drive, "library_available", lambda: True)
+
+    assert cli.main(
+        ["--db", dbp, "--config", str(cfg), "--json", "ocr", "run", "--root", str(root)]
+    ) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["drive"] == {
+        "available": False,
+        "reason": "token_missing",
+        "status": "unavailable",
+        "fetched": 0,
+        "empty": 0,
+        "failed": 0,
+        "swept": 0,
+        "delete_failures": 0,
+        "hint": "filingcabinet ocr auth",
+    }
+
+    assert cli.main(["--db", dbp, "--config", str(cfg), "ocr", "run", "--root", str(root)]) == 0
+    captured = capsys.readouterr()
+    assert "drive: not authorized - run filingcabinet ocr auth" in captured.err
+    assert "drive: unavailable (token_missing)" in captured.out
+    assert DRIVE_SECRET not in captured.out + captured.err
+
+
+def test_ocr_run_without_drive_in_the_ladder_has_no_drive_block(tmp_path, capsys):
+    cfg, _data_dir, root = _drive_instance(tmp_path, ladder='["local", "vision"]')
+    dbp = _migrated_db(tmp_path, capsys)
+    assert cli.main(
+        ["--db", dbp, "--config", str(cfg), "--json", "ocr", "run", "--root", str(root)]
+    ) == 0
+    assert "drive" not in json.loads(capsys.readouterr().out)
+
+
+def test_doctor_reports_drive_presence_without_secrets(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("FC_DB", raising=False)
+    cfg, data_dir, _root = _drive_instance(tmp_path)
+    _plant_credentials(data_dir)
+
+    assert cli.main(["--config", str(cfg), "--json", "doctor"]) == 0
+    raw = capsys.readouterr().out
+    report = json.loads(raw)["drive"]
+    assert (report["client_secret"], report["token"]) == (True, True)
+    assert report["scopes"] == ["drive.file", "drive.readonly"]
+    assert report["temp_folder"] == "filingcabinet-ocr-tmp"
+    # The default excludes do not cover the temp folder, and drive is in the ladder: warn.
+    assert report["temp_folder_excluded"] is False
+    assert any("filingcabinet-ocr-tmp" in warning for warning in report["warnings"])
+    assert DRIVE_SECRET not in raw
+
+    assert cli.main(["--config", str(cfg), "doctor"]) == 0
+    text = capsys.readouterr().out
+    assert "drive: library" in text and "client secret present, token present" in text
+    assert "warning: temp folder" in text
+    assert DRIVE_SECRET not in text
+
+
+def test_doctor_temp_folder_check_uses_the_effective_excludes(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("FC_DB", raising=False)
+    cfg, _data_dir, _root = _drive_instance(
+        tmp_path, extra='\n[ingest]\nexclude = [".*", "FilingCabinet-OCR-*"]\n'
+    )
+    assert cli.main(["--config", str(cfg), "--json", "doctor"]) == 0
+    report = json.loads(capsys.readouterr().out)["drive"]
+    assert report["temp_folder_excluded"] is True and report["warnings"] == []
+    assert (report["client_secret"], report["token"], report["scopes"]) == (False, False, [])
+
+
+def test_doctor_warns_when_data_dir_is_synced(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("FC_DB", raising=False)
+    root = _make_root(tmp_path)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        f"[paths]\nroot = '{root.as_posix()}'\ndata_dir = '{(root / 'fc').as_posix()}'\n",
+        encoding="utf-8",
+    )
+    assert cli.main(["--config", str(cfg), "--json", "doctor"]) == 0
+    report = json.loads(capsys.readouterr().out)["drive"]
+    assert report["data_dir_synced"] is True
+    assert any("Drive syncs" in warning for warning in report["warnings"])

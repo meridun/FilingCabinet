@@ -24,6 +24,7 @@ from . import (
     apply as apply_mod,
     db,
     dedup as dedup_mod,
+    drive as drive_mod,
     ingest as ingest_mod,
     instance as instance_mod,
     ocr as ocr_mod,
@@ -410,13 +411,63 @@ def _resolve_ocr_config(args: argparse.Namespace) -> ocr_mod.OcrConfig:
     return ocr_mod.OcrConfig.from_mapping(load_config(args.config).get("ocr"))
 
 
+def _resolve_data_dir(args: argparse.Namespace) -> Path | None:
+    """`[paths].data_dir` only - no --db fallback: Drive secrets live in the configured dir."""
+    configured = load_config(args.config).get("paths", {}).get("data_dir")
+    if not isinstance(configured, str) or not configured.strip():
+        return None
+    return config_relative(configured, args.config)
+
+
+def _forbidden_secret_dirs(args: argparse.Namespace) -> list[Path]:
+    """The Drive-synced directories a credential must never land under: root and snapshot_dir.
+
+    Every way each can be named counts (config, environment, flag), so a refusal never depends
+    on which one this invocation happened to use.
+    """
+    paths = load_config(args.config).get("paths", {})
+    found: list[Path] = []
+    for key in ("root", "snapshot_dir"):
+        configured = paths.get(key)
+        if isinstance(configured, str) and configured.strip():
+            found.append(config_relative(configured, args.config))
+    for supplied in (
+        getattr(args, "root", None),
+        os.environ.get("FC_ROOT"),
+        getattr(args, "snapshot_dir", None),
+        os.environ.get("FC_SNAPSHOT_DIR"),
+    ):
+        if supplied:
+            found.append(Path(supplied))
+    return found
+
+
+def _resolve_drive_config(args: argparse.Namespace) -> drive_mod.DriveConfig:
+    """`[ocr.drive]`; a missing or malformed table falls back to defaults."""
+    ocr_table = load_config(args.config).get("ocr")
+    return drive_mod.DriveConfig.from_mapping(
+        ocr_table.get("drive") if isinstance(ocr_table, dict) else None
+    )
+
+
+def _effective_excludes(args: argparse.Namespace) -> tuple[str, ...]:
+    """What `ingest` actually excludes: `[ingest].exclude` when set, else the defaults."""
+    excludes = load_config(args.config).get("ingest", {}).get("exclude")
+    if isinstance(excludes, (list, tuple)) and excludes:
+        return tuple(str(pattern) for pattern in excludes)
+    return ingest_mod.DEFAULT_EXCLUDES
+
+
 def cmd_ocr_run(args: argparse.Namespace) -> int:
     db_path = _require_database(args)
     root = resolve_root(args)
     config = _resolve_ocr_config(args)
+    session = None
+    if "drive" in config.ladder:
+        session = drive_mod.open_session(_resolve_drive_config(args), _resolve_data_dir(args))
     conn = db.connect(db_path)
     try:
-        summary = ocr_mod.run_ocr(conn, root, config=config, limit=args.limit)
+        summary = ocr_mod.run_ocr(conn, root, config=config, limit=args.limit, drive=session)
     finally:
         conn.close()
     payload = {
@@ -426,14 +477,50 @@ def cmd_ocr_run(args: argparse.Namespace) -> int:
         "min_confidence": config.min_confidence,
         **summary.as_dict(),
     }
-    _emit(
-        args,
-        payload,
+    text = (
         f"{root}: {summary.documents} document(s), {summary.pages} page(s) - {summary.ok} ok, "
         f"{summary.pending_drive} pending drive, "
         f"{summary.pending_vision} pending vision, {summary.skipped} skipped, "
         f"{summary.exhausted} exhausted, {summary.degraded} degraded (toolchain), "
-        f"{summary.errors} error(s)",
+        f"{summary.errors} error(s)"
+    )
+    if session is not None:
+        payload["drive"] = session.as_dict()
+        text += (
+            f"\ndrive: {session.status}"
+            + (f" ({session.reason})" if session.reason else "")
+            + f", {session.fetched} fetched, {session.empty} empty, {session.failed} failed, "
+            f"{session.swept} swept, {session.delete_failures} delete failure(s)"
+        )
+        if session.needs_auth and not args.json:
+            print(f"drive: not authorized - run {drive_mod.AUTH_COMMAND}", file=sys.stderr)
+    _emit(args, payload, text)
+    return 0
+
+
+def cmd_ocr_auth(args: argparse.Namespace) -> int:
+    """One-time interactive Drive authorization; the token lands in `[paths].data_dir` only."""
+    data_dir = _resolve_data_dir(args)
+    if data_dir is None:
+        raise SystemExit(
+            "error: no data directory - set [paths].data_dir in config.toml; Drive credentials "
+            "live only there (see config.example.toml)"
+        )
+    try:
+        result = drive_mod.authorize(
+            data_dir,
+            client_secret=Path(args.client_secret) if args.client_secret else None,
+            forbidden=_forbidden_secret_dirs(args),
+        )
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    except OSError as exc:
+        raise SystemExit(f"error: cannot write Drive credentials to {data_dir}: {exc}") from exc
+    _emit(
+        args,
+        result,
+        f"authorized: token written to {result['token_path']} "
+        f"(scopes: {', '.join(result['scopes'])})",
     )
     return 0
 
@@ -707,16 +794,53 @@ def cmd_undo(args: argparse.Namespace) -> int:
     return 0
 
 
+def _drive_doctor(args: argparse.Namespace, config: ocr_mod.OcrConfig) -> tuple[dict, str]:
+    """Drive credential presence, scope names and the temp-folder check - never a value."""
+    report = drive_mod.doctor_report(
+        _resolve_drive_config(args),
+        _resolve_data_dir(args),
+        excludes=_effective_excludes(args),
+        forbidden=_forbidden_secret_dirs(args),
+    )
+    warnings: list[str] = []
+    if "drive" in config.ladder and not report["temp_folder_excluded"]:
+        warnings.append(
+            f"temp folder {report['temp_folder']!r} is not in the effective [ingest].exclude - "
+            "add it, or ingest will index Drive's temporary copies"
+        )
+    if report["data_dir_synced"]:
+        warnings.append(
+            "data_dir is inside [paths].root or [paths].snapshot_dir, which Drive syncs - move "
+            "it to a local-only path before authorizing Drive"
+        )
+    report["warnings"] = warnings
+
+    def presence(flag: bool) -> str:
+        return "present" if flag else "missing"
+
+    lines = [
+        f"drive: library {'installed' if report['library'] else 'not installed'}, client "
+        f"secret {presence(report['client_secret'])}, token {presence(report['token'])}, "
+        f"scopes {', '.join(report['scopes']) or 'none'}, temp folder "
+        f"{report['temp_folder']!r} "
+        f"{'excluded' if report['temp_folder_excluded'] else 'not excluded'}"
+    ]
+    lines += [f"warning: {warning}" for warning in warnings]
+    return report, "\n".join(lines)
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
-    """Report the OCR toolchain. Absence is a report, not a failure: always exits 0."""
+    """Report the OCR toolchain and Drive setup. Absence is a report: always exits 0."""
     tesseract = ocr_mod.tesseract_version()
     pymupdf = ocr_mod.pymupdf_version()
     config = _resolve_ocr_config(args)
+    drive_report, drive_text = _drive_doctor(args, config)
     payload = {
         "tesseract": {"present": tesseract is not None, "version": tesseract},
         "pymupdf": {"present": pymupdf is not None, "version": pymupdf},
         "ladder": list(config.ladder),
         "min_confidence": config.min_confidence,
+        "drive": drive_report,
     }
     try:  # the db is optional here - doctor reports the toolchain either way
         db_path = resolve_db_path(args)
@@ -736,7 +860,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         args,
         payload,
         f"tesseract: {tesseract or 'not found'}\npymupdf: {pymupdf or 'not found'}\n"
-        f"ladder: {', '.join(config.ladder)} (min_confidence {config.min_confidence})",
+        f"ladder: {', '.join(config.ladder)} (min_confidence {config.min_confidence})\n"
+        f"{drive_text}",
     )
     return 0
 
@@ -816,6 +941,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     q.add_argument("--text-file", required=True, help="file holding the text, or - for stdin")
     q.set_defaults(func=cmd_ocr_submit)
+    q = ocr_sub.add_parser(
+        "auth",
+        help="authorize the drive rung's Drive API access (token stored in [paths].data_dir)",
+    )
+    q.add_argument(
+        "--client-secret",
+        help="OAuth desktop client JSON to copy into [paths].data_dir (needed the first time)",
+    )
+    q.set_defaults(func=cmd_ocr_auth)
 
     p = sub.add_parser("find", help="full-text search over OCR text")
     p.add_argument("query", help="search terms (FTS5 syntax is honoured when present)")
@@ -860,7 +994,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="report what would reverse, move nothing")
     p.set_defaults(func=cmd_undo)
 
-    p = sub.add_parser("doctor", help="report the OCR toolchain (tesseract, PyMuPDF)")
+    p = sub.add_parser(
+        "doctor", help="report the OCR toolchain (tesseract, PyMuPDF) and Drive credentials"
+    )
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("dupes", help="duplicate detection: report tiers, label the sample")

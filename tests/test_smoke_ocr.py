@@ -188,8 +188,9 @@ DRIVE_BLOB = (
 def test_drive_rung_smoke_end_to_end(tmp_path):
     """Issue #9's acceptance criteria, walked through the real CLI over a real tree.
 
-    The gating real run for the agent-driven `drive` rung: a ladder that parks pages at
-    `pending_drive` instead of `pending_vision`, a document-level submit resolved by sha256,
+    The gating real run for the agent-submit path of the `drive` rung: a ladder with `drive`
+    but no Drive authorization (the rung reports itself unavailable and the pages stay
+    retryable), a document-level submit resolved by sha256,
     the `Image labels:` trailer stripped, an empty Drive answer leaving the local read as the
     fallback, and the document tree untouched throughout (``docs/Architecture.md`` section 6).
     """
@@ -222,23 +223,27 @@ def test_drive_rung_smoke_end_to_end(tmp_path):
     faint = _document_id_of(db, "archive/invoice.pdf")
     sha = _query(db, "SELECT sha256 FROM document WHERE document_id = ?", (invoice,))[0]["sha256"]
 
-    # AC 3: with `drive` before `vision`, deferred pages park at `pending_drive`.
+    # With `drive` before `vision` but no Drive authorization (no data_dir here), the rung is
+    # unavailable: deferred pages move on to `pending_vision` carrying the reason, count as
+    # degraded, and stay open to the agent's `--source drive` submit below.
     first = _run(db, "ocr", "run", "--root", str(root), config=config)
-    assert first["errors"] == 0 and first["pending_vision"] == 0
-    assert first["pending_drive"] == 3  # two blank invoice pages + the faint receipt
-    assert first["pages"] == first["ok"] + first["pending_drive"] + first["skipped"] + \
+    assert first["errors"] == 0 and first["pending_drive"] == 0
+    assert first["pending_vision"] == 3  # two blank invoice pages + the faint receipt
+    assert first["degraded"] == 3 and first["drive"]["available"] is False
+    assert first["pages"] == first["ok"] + first["pending_vision"] + first["skipped"] + \
         first["exhausted"]
     pages = _pages_of(db, invoice)
     assert pages[1]["status"] == "ok"  # the text layer finished at the local rung
-    assert [pages[2]["status"], pages[3]["status"]] == ["pending_drive", "pending_drive"]
+    assert [pages[n]["note"] for n in (2, 3)] == ["rung_unavailable:drive"] * 2
     # The thin local read is carried onto the deferred row rather than blanked.
     carried = _pages_of(db, faint)[1]
-    assert carried["status"] == "pending_drive" and (carried["text"] or "").strip()
+    assert carried["status"] == "pending_vision" and (carried["text"] or "").strip()
+    assert carried["note"] == "rung_unavailable:drive"
 
-    # AC 3: a page waiting for the agent is sticky - a re-run must not escalate it to vision.
-    _run(db, "ocr", "run", "--root", str(root), config=config)
-    assert _pages_of(db, invoice)[2]["status"] == "pending_drive"
-    assert _pages_of(db, faint)[1]["status"] == "pending_drive"
+    # A re-run retries the unavailable rung rather than writing the pages off, and keeps the read.
+    again = _run(db, "ocr", "run", "--root", str(root), config=config)
+    assert (again["pages"], again["degraded"]) == (3, 3)
+    assert _pages_of(db, faint)[1]["text"] == carried["text"]
 
     # AC 2: a bare filename is a title, and a title is ambiguous - never silently matched.
     refused = _cli(
@@ -289,3 +294,141 @@ def test_drive_rung_smoke_end_to_end(tmp_path):
 
     # AC 7 / Architecture section 6: the whole exchange wrote only the index.
     assert _tree_fingerprint(root) == fingerprint
+
+
+# Synthetic stand-ins for credential values, written into the test's own data_dir. They exist
+# only so the smoke can assert that no report ever echoes a credential back.
+PLANTED_SECRET = "planted-client-secret-7f3c"
+PLANTED_TOKEN = "planted-refresh-token-9a1e"
+
+
+@requires_pymupdf
+def test_drive_api_rung_smoke_end_to_end(tmp_path, fake_drive):
+    """Issue #32's acceptance criteria over a real tree, a real index and the real CLI.
+
+    The gating real run for the unattended `drive` rung. `doctor` and `ocr auth` run as real
+    subprocesses with credential files in a local-only `data_dir`; the ladder walk runs the real
+    engine over the CLI-built index with the in-memory Drive (no network, no real credential):
+    the same title in two folders resolved by path and size, the document-level blob with the
+    trailer stripped, Drive writes confined to the marked temp folder and deleted, and the
+    document tree untouched throughout (``docs/Architecture.md`` section 6).
+    """
+    from filingcabinet import db as db_mod
+    from filingcabinet import drive, ocr as ocr_mod
+
+    db = tmp_path / "fc.db"
+    root = tmp_path / "root"
+    data_dir = tmp_path / "data"
+    snapshot_dir = tmp_path / "snap"
+    for directory in (root / "scans", root / "archive", data_dir, snapshot_dir):
+        directory.mkdir(parents=True)
+    # A dense text-layer page, then two the local rung cannot read.
+    _write_pdf(
+        root / "scans" / "statement.pdf",
+        [[LETTER[i : i + 90] for i in range(0, len(LETTER), 90)], "", ""],
+    )
+    # Same title in another folder, different bytes: identity must come from path and size.
+    _write_pdf(root / "archive" / "statement.pdf", ["Faint carbon copy receipt zzqq"],
+               render_mode=3)
+
+    def write_config(path, data):
+        path.write_text(
+            "[paths]\nroot = \"%s\"\ndata_dir = \"%s\"\nsnapshot_dir = \"%s\"\n\n"
+            "[ocr]\nladder = [\"local\", \"drive\", \"vision\"]\n\n"
+            "[ingest]\nexclude = [\".*\", \"~$*\", \"*.tmp\", \"FilingCabinet-OCR-Tmp\"]\n"
+            % (root.as_posix(), data.as_posix(), snapshot_dir.as_posix()),
+            encoding="utf-8",
+        )
+        return path
+
+    config = write_config(tmp_path / "config.toml", data_dir)
+    assert _run(db, "migrate", "--create")["created"] is True
+    assert _run(db, "ingest", "--root", str(root), config=config)["new"] == 2
+    fingerprint = _tree_fingerprint(root)
+
+    # `doctor`: presence and scope names only, in both outputs; the case-insensitive exclude
+    # covers the temp folder, so there is nothing to warn about. Exit code stays 0.
+    (data_dir / drive.CLIENT_SECRET_FILENAME).write_text(
+        '{"installed": {"client_id": "x", "client_secret": "%s"}}' % PLANTED_SECRET,
+        encoding="utf-8",
+    )
+    (data_dir / drive.TOKEN_FILENAME).write_text(
+        '{"refresh_token": "%s", "client_secret": "%s", "scopes": ["%s", "%s"]}'
+        % (PLANTED_TOKEN, PLANTED_SECRET, *drive.SCOPES),
+        encoding="utf-8",
+    )
+    report = _cli(db, "doctor", config=config)
+    plain = subprocess.run(
+        [sys.executable, "-m", "filingcabinet.cli", "--db", str(db), "--config", str(config),
+         "doctor"],
+        capture_output=True, text=True, check=True,
+    )
+    for output in (report.stdout, report.stderr, plain.stdout, plain.stderr):
+        assert PLANTED_SECRET not in output and PLANTED_TOKEN not in output
+    block = json.loads(report.stdout)["drive"]
+    assert (block["client_secret"], block["token"]) == (True, True)
+    assert block["scopes"] == ["drive.file", "drive.readonly"]
+    assert (block["temp_folder_excluded"], block["data_dir_synced"], block["warnings"]) == (
+        True, False, []
+    )
+    assert "client secret present, token present" in plain.stdout
+
+    # `ocr auth` refuses a data_dir Drive would sync, before writing anything anywhere.
+    synced = write_config(tmp_path / "synced.toml", root / "creds")
+    refused = _cli(db, "ocr", "auth", "--client-secret",
+                   str(data_dir / drive.CLIENT_SECRET_FILENAME), config=synced, check=False)
+    assert refused.returncode != 0 and "Drive syncs" in refused.stderr
+    assert PLANTED_SECRET not in refused.stderr + refused.stdout
+    assert _tree_fingerprint(root) == fingerprint and not (root / "creds").exists()
+
+    # The unattended walk: real PyMuPDF and index, in-memory Drive.
+    blob = "Statement balance 9921 carried forward.\n\nImage labels: [document, text]\n"
+    fake_drive.add_path("scans/statement.pdf",
+                        size=(root / "scans" / "statement.pdf").stat().st_size, text=blob)
+    fake_drive.add_path("archive/statement.pdf",
+                        size=(root / "archive" / "statement.pdf").stat().st_size,
+                        text="Carbon copy 5531")
+    session = drive.DriveSession(drive.DriveConfig(), fake_drive)
+    conn = db_mod.connect(db)
+    try:
+        summary = ocr_mod.run_ocr(
+            conn, root, config=ocr_mod.OcrConfig(ladder=("local", "drive", "vision")),
+            drive=session,
+        )
+    finally:
+        conn.close()
+    assert (summary.errors, summary.pending_vision, summary.pending_drive, summary.degraded) == (
+        0, 0, 0, 0
+    )
+    assert (session.fetched, session.failed, session.delete_failures) == (2, 0, 0)
+
+    scans = _pages_of(db, _document_id_of(db, "scans/statement.pdf"))
+    assert scans[1]["rung"] == "local" and "Northwind" in scans[1]["text"]
+    assert (scans[2]["status"], scans[2]["rung"], scans[2]["ocr_source"]) == (
+        "ok", "drive", "drive"
+    )
+    assert scans[2]["text"].startswith("Statement balance 9921")
+    assert "Image labels" not in scans[2]["text"]  # the trailer is stripped
+    assert scans[2]["confidence"] == ocr_mod.DRIVE_CONFIDENCE
+    assert (scans[3]["status"], scans[3]["rung"]) == ("ok", "drive")  # resolved, one fetch
+    archive = _pages_of(db, _document_id_of(db, "archive/statement.pdf"))
+    assert archive[1]["text"] == "Carbon copy 5531"  # its own blob, not the other title's
+
+    # Drive writes: one marked temp folder, a copy per document inside it, each deleted.
+    writes = fake_drive.writes()
+    folders = [call for call in writes if call[0] == "create_marked_folder"]
+    assert folders == [("create_marked_folder", drive.DEFAULT_TEMP_FOLDER)]
+    temp_id = drive.DriveSession(drive.DriveConfig(), fake_drive)._temp_folder()
+    copies = [call for call in writes if call[0] == "copy_as_doc"]
+    assert len(copies) == 2 and {call[2] for call in copies} == {temp_id}
+    assert not [n for n in fake_drive.nodes.values() if n["mark"] == drive.COPY_MARK]
+
+    assert _run(db, "find", "9921")["count"] == 1  # the drive text is indexed
+    assert _run(db, "find", "northwind")["count"] == 1  # ... and the local read still is
+
+    # A CLI re-run has nothing left to walk; without a token it reports why, and still exits 0.
+    (data_dir / drive.TOKEN_FILENAME).unlink()
+    again = _run(db, "ocr", "run", "--root", str(root), config=config)
+    assert again["pages"] == 0 and again["drive"]["available"] is False
+
+    assert _tree_fingerprint(root) == fingerprint  # the whole exchange wrote only the index

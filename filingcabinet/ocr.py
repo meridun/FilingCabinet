@@ -1,14 +1,18 @@
 """Phase 4 OCR ladder (docs/Architecture.md §5).
 
 Per-page ladder driven by `[ocr].ladder`: `local` reads the embedded PyMuPDF text layer and
-falls back to tesseract on rasterized pages; `drive` and `vision` are both agent-driven rungs,
-marked here and committed later by `submit_drive_text` / `submit_vision_text`. An unimplemented
-rung name is still skipped with a recorded reason rather than treated as an error.
+falls back to tesseract on rasterized pages; `drive` fetches Google Drive's own text layer
+through the Drive API (`filingcabinet.drive`) when the instance has authorized it; `vision` is
+agent-driven, marked here and committed later by `submit_vision_text`. An unimplemented rung
+name is still skipped with a recorded reason rather than treated as an error.
 
-The `drive` rung is document-level on the way in: the Drive connector returns one text blob per
-document with no page boundaries, so `submit_drive_text` commits the blob to the lowest-numbered
-pending page and marks the document's other pending pages resolved at the `drive` rung with
-their existing text preserved. Text is therefore document-accurate and page-approximate.
+The `drive` rung is document-level: Drive returns one text blob per document with no page
+boundaries, so the first page of a document to reach the rung triggers one fetch, memoised for
+the rest of that document's walk. The blob lands on that page - the lowest-numbered pending one -
+and the document's later pending pages are resolved at `drive` with their own text preserved.
+Text is therefore document-accurate and page-approximate. Without a usable Drive session the rung
+records `rung_unavailable:drive` and the next run resumes at it; `submit_drive_text` (`ocr submit
+--source drive`) stays as the agent fallback for anything the API path skips.
 
 A page is done when its recorded confidence reaches `[ocr].min_confidence`; a page below it
 resumes at the rung *after* the one recorded, so re-runs strictly advance and a page whose
@@ -37,6 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import db
+from . import drive as drive_mod
 
 RENDER_DPI = 300
 MAX_SUBMIT_CHARS = 1_000_000
@@ -70,6 +75,8 @@ NOTE_RUNG_UNAVAILABLE = "rung_unavailable:"
 # Drive answered with nothing. A quality reason, not an availability one: Drive OCR is
 # opportunistic, so the rung is not retried and the page resumes strictly after it.
 NOTE_DRIVE_EMPTY = "drive_empty"
+# The API returned more text than any submit may carry. Quality class, like `drive_empty`.
+NOTE_DRIVE_TOO_LONG = drive_mod.NOTE_TOO_LONG
 
 # Drive returns image files with a trailing `Image labels: [...]` machine annotation. Anchored at
 # the end of the string, so no interior line is touched. Both quantifiers are *possessive* (`*+`,
@@ -291,6 +298,7 @@ def _rung_local(
     min_confidence: float,
     extractor: Callable = extract_text_layer,
     runner: Callable[[Path], tuple[str, float]] = run_tesseract,
+    **_kwargs,
 ) -> PageResult:
     """Text layer first; tesseract on the rasterized page only when the layer is too thin."""
     try:
@@ -328,9 +336,70 @@ def _rung_local(
     )
 
 
-def _rung_drive(page, **_kwargs) -> PageResult:
-    """A marker, never work: drive needs an agent round trip (`ocr submit --source drive`)."""
-    return PageResult(rung="drive", status=STATUS_PENDING_DRIVE)
+class _DriveDocument:
+    """One document's `drive` outcome: fetched once, by the first page to reach the rung.
+
+    The first call fetches through the session; later calls return the same outcome, except
+    that after a success they carry no text - the "resolved at drive" row, whose own text the
+    walk (or `_keep_earlier_read`) preserves - so the blob lands on exactly one page.
+    """
+
+    def __init__(
+        self,
+        session: drive_mod.DriveSession | None,
+        occurrences: Iterable[tuple[str, int | None]],
+    ):
+        self._session = session
+        self._occurrences = list(occurrences)
+        self._outcome: PageResult | None = None
+
+    def result(self) -> PageResult:
+        if self._outcome is None:
+            self._outcome = self._fetch()
+            return self._outcome
+        if self._outcome.status == STATUS_OK:
+            return replace(self._outcome, text=None)
+        return self._outcome
+
+    def _fetch(self) -> PageResult:
+        session = self._session
+        if session is None or not session.available:
+            return PageResult(
+                rung="drive", status=STATUS_SKIPPED, note=f"{NOTE_RUNG_UNAVAILABLE}drive"
+            )
+        fetched = session.fetch(self._occurrences)
+        if fetched.note or fetched.text is None:
+            session.record("failed")
+            return PageResult(
+                rung="drive",
+                status=STATUS_SKIPPED,
+                note=fetched.note or drive_mod.NOTE_CONVERT_FAILED,
+            )
+        raw = fetched.text
+        if len(raw) > MAX_SUBMIT_CHARS:  # cap the raw input, before any stripping
+            session.record("failed")
+            return PageResult(rung="drive", status=STATUS_SKIPPED, note=NOTE_DRIVE_TOO_LONG)
+        cleaned = strip_drive_trailer(raw)
+        if not cleaned.strip():
+            session.record("empty")
+            return PageResult(rung="drive", status=STATUS_SKIPPED, note=NOTE_DRIVE_EMPTY)
+        session.record("fetched")
+        return PageResult(
+            text=cleaned,
+            confidence=DRIVE_CONFIDENCE,
+            rung="drive",
+            ocr_source="drive",
+            status=STATUS_OK,
+        )
+
+
+def _rung_drive(page, *, drive_doc: _DriveDocument | None = None, **_kwargs) -> PageResult:
+    """Drive's text layer for the page's document, via the per-document memo."""
+    if drive_doc is None:
+        return PageResult(
+            rung="drive", status=STATUS_SKIPPED, note=f"{NOTE_RUNG_UNAVAILABLE}drive"
+        )
+    return drive_doc.result()
 
 
 def _rung_vision(page, **_kwargs) -> PageResult:
@@ -356,16 +425,32 @@ def _row_note(row) -> str | None:
 def _unavailable_rung(note: str | None) -> str | None:
     """The rung a note says could not run at all, or None for a quality reason.
 
-    `tesseract_missing` and `rung_unavailable:<name>` are properties of the environment, so the
-    page is not finished with that rung - it never got to try it.
+    `tesseract_missing`, `rung_unavailable:<name>` and the Drive environment notes (offline,
+    unauthenticated, quota) are properties of the environment, so the page is not finished with
+    that rung - it never got a real answer from it.
     """
     if not note:
         return None
     if note == NOTE_TESSERACT_MISSING:
         return "local"
+    if note in drive_mod.ENVIRONMENT_NOTES:
+        return "drive"
     if note.startswith(NOTE_RUNG_UNAVAILABLE):
         return note[len(NOTE_RUNG_UNAVAILABLE) :] or None
     return None
+
+
+def _is_drive_attempt(note: str | None) -> bool:
+    """The note records an answer (or a failure) from the drive rung itself."""
+    return bool(note) and note.startswith("drive_")
+
+
+def _row_status(row) -> str | None:
+    """The row's status, tolerating a row selected without that column."""
+    try:
+        return row["status"]
+    except (IndexError, KeyError, TypeError):
+        return None
 
 
 def _resume_index(ladder: tuple[str, ...], row: sqlite3.Row | None) -> int:
@@ -375,12 +460,30 @@ def _resume_index(ladder: tuple[str, ...], row: sqlite3.Row | None) -> int:
     *unavailable* resumes **at** that rung, so a toolchain installed since the last run is
     actually used. The re-attempt is a cheap no-op while the rung stays unavailable, and the
     walk still advances past it, so nothing loops.
+
+    Two more bring pages back to `drive` that never got an answer from it: a `pending_drive`
+    row (parked for an agent by the older marker rung), and a `pending_vision` row recorded
+    past `drive` with no drive attempt in its note (the pre-rung backlog). Once the rung has
+    answered, the page carries a `drive_*` note and a quality failure is never re-fetched.
     """
     if row is None or not row["rung"]:
         return 0
-    blocked = _unavailable_rung(_row_note(row))
+    note = _row_note(row)
+    blocked = _unavailable_rung(note)
     if blocked is not None and blocked in ladder:
         return ladder.index(blocked)
+    if "drive" in ladder:
+        drive_at = ladder.index("drive")
+        status = _row_status(row)
+        if status == STATUS_PENDING_DRIVE:
+            return drive_at
+        if (
+            status == STATUS_PENDING_VISION
+            and not _is_drive_attempt(note)
+            and row["rung"] in ladder
+            and ladder.index(row["rung"]) > drive_at
+        ):
+            return drive_at
     try:
         return ladder.index(row["rung"]) + 1
     except ValueError:  # the ladder changed under us: start over rather than guess
@@ -401,19 +504,24 @@ def walk_ladder(
     tmp_dir: Path,
     extractor: Callable = extract_text_layer,
     runner: Callable[[Path], tuple[str, float]] = run_tesseract,
+    drive_doc: _DriveDocument | None = None,
+    seed_note: str | None = None,
 ) -> PageResult:
     """Run the ladder from ``start_index`` until a rung clears the bar or the ladder is spent.
 
     Stops at the first rung whose confidence reaches `min_confidence` (`ok`) or that defers to
-    an agent (`pending_drive` / `pending_vision`). An unimplemented rung name is recorded and
-    stepped over. When
+    an agent (`pending_vision`). An unimplemented rung name is recorded and stepped over. When
     no rung remains, the best result seen is recorded as `exhausted` - unless the last rung
     reported an environment reason (`skipped` + note), which is kept so an operator can see it.
+
+    ``seed_note`` is the page's earlier drive-attempt note, carried so a walk that starts past
+    `drive` does not erase the fact that the rung already answered (which would re-home the page
+    to `drive` and re-fetch it on every run).
     """
     best = PageResult()
     have_best = False
     last: PageResult | None = None
-    carry_note: str | None = None
+    carry_note: str | None = seed_note
     for name in config.ladder[start_index:]:
         rung = RUNGS.get(name)
         if rung is None:
@@ -428,9 +536,14 @@ def walk_ladder(
             min_confidence=config.min_confidence,
             extractor=extractor,
             runner=runner,
+            drive_doc=drive_doc,
         )
         last = result
         if _unavailable_rung(result.note) is not None:
+            carry_note = result.note
+        elif _is_drive_attempt(result.note) and _unavailable_rung(carry_note) is None:
+            # A drive quality answer is carried so the page is not re-homed to `drive`; an
+            # environment note already carried wins, because it is what drives the retry.
             carry_note = result.note
         if result.status in _AGENT_PENDING:
             # Carry the best read so far, so a partial local read is not lost while the page
@@ -446,12 +559,22 @@ def walk_ladder(
                     note=carry_note or result.note,
                 )
             return replace(result, note=carry_note or result.note)
+        if result.confidence >= config.min_confidence:
+            if not _has_text(result) and have_best and _has_text(best):
+                # A document-level drive answer resolved this page without text of its own:
+                # keep the page's own read rather than blanking it.
+                result = replace(result, text=best.text)
+            return replace(result, status=STATUS_OK)
         if not have_best or result.confidence > best.confidence:
             best, have_best = result, True
-        if result.confidence >= config.min_confidence:
-            return replace(result, status=STATUS_OK)
     if last is not None and last.status == STATUS_SKIPPED and last.note:
-        return last  # an availability reason is more useful than a bare `exhausted`
+        # An availability reason is more useful than a bare `exhausted`; a read an earlier rung
+        # made is carried rather than dropped with it.
+        if not _has_text(last) and have_best and _has_text(best):
+            return replace(
+                last, text=best.text, confidence=best.confidence, ocr_source=best.ocr_source
+            )
+        return last
     # Record the last rung attempted, so the next run resumes strictly after it.
     return replace(
         best,
@@ -459,6 +582,10 @@ def walk_ladder(
         rung=last.rung if last is not None else best.rung,
         note=carry_note or best.note,
     )
+
+
+def _has_text(result: PageResult) -> bool:
+    return bool(result.text and result.text.strip())
 
 
 def _keep_earlier_read(
@@ -553,6 +680,7 @@ def ocr_document(
     now: str | None = None,
     extractor: Callable = extract_text_layer,
     runner: Callable[[Path], tuple[str, float]] = run_tesseract,
+    drive: drive_mod.DriveSession | None = None,
 ) -> OcrSummary:
     """Walk the ladder over every page of one document. Read-only on ``path``."""
     if _fitz is None:  # pragma: no cover - depends on the local environment
@@ -575,6 +703,19 @@ def ocr_document(
     }
     pages = 0
     degraded = 0
+    drive_doc = None
+    if "drive" in config.ladder:
+        drive_doc = _DriveDocument(
+            drive,
+            [
+                (occurrence["rel_path"], occurrence["size_bytes"])
+                for occurrence in conn.execute(
+                    "SELECT rel_path, size_bytes FROM occurrence "
+                    "WHERE document_id = ? AND missing_since IS NULL ORDER BY rel_path",
+                    (document_id,),
+                )
+            ],
+        )
     with tempfile.TemporaryDirectory(prefix="fc-ocr-") as tmp:
         tmp_dir = Path(tmp)  # never under [paths].root (docs/Architecture.md §6)
         with _fitz.open(path) as document:
@@ -584,16 +725,7 @@ def ocr_document(
                 start_index = _resume_index(config.ladder, row)
                 if _page_is_done(row, config.min_confidence) or start_index >= len(config.ladder):
                     continue  # done, or the ladder is spent: never retried
-                if (
-                    row is not None
-                    and row["status"] == STATUS_PENDING_DRIVE
-                    and "drive" in config.ladder
-                ):
-                    # A page parked for the Drive agent is sticky: re-walking it here would
-                    # escalate it to `pending_vision` before any submission could arrive, so the
-                    # rung would look wired up and never collect one. Dropping `drive` from the
-                    # ladder is the escape hatch (`_resume_index` then restarts the page).
-                    continue
+                note = _row_note(row) if row is not None else None
                 result = walk_ladder(
                     page,
                     config=config,
@@ -601,6 +733,8 @@ def ocr_document(
                     tmp_dir=tmp_dir,
                     extractor=extractor,
                     runner=runner,
+                    drive_doc=drive_doc,
+                    seed_note=note if _is_drive_attempt(note) else None,
                 )
                 with conn:  # commit per page: an interrupted run resumes where it stopped
                     _upsert_page(conn, document_id, page_number, result, stamp)
@@ -660,11 +794,14 @@ def run_ocr(
     now: str | None = None,
     extractor: Callable = extract_text_layer,
     runner: Callable[[Path], tuple[str, float]] = run_tesseract,
+    drive: drive_mod.DriveSession | None = None,
 ) -> OcrSummary:
     """Run the ladder over every live document under ``root``.
 
     Degrades rather than raises: without PyMuPDF every candidate is reported skipped, and an
-    unreadable or unopenable document is counted in `errors` while the run carries on.
+    unreadable or unopenable document is counted in `errors` while the run carries on. With a
+    usable Drive session and `drive` in the ladder, stray temp copies an earlier crash left in
+    Drive are swept once before any new work.
     """
     db.require_migrated(conn)
     config = config or OcrConfig()
@@ -673,6 +810,8 @@ def run_ocr(
     if _fitz is None:  # pragma: no cover - depends on the local environment
         return OcrSummary(skipped=len(candidates))
 
+    if drive is not None and drive.available and "drive" in config.ladder:
+        drive.sweep()
     summary = OcrSummary()
     for row in candidates:
         path = root / row["rel_path"]
@@ -694,6 +833,7 @@ def run_ocr(
                     now=now,
                     extractor=extractor,
                     runner=runner,
+                    drive=drive,
                 ),
             )
         except (OSError, sqlite3.Error):
