@@ -328,6 +328,161 @@ def test_google_client_reduces_library_errors_to_a_bare_note(tmp_path):
     assert SECRET_MARK not in str(caught.value) and caught.value.__cause__ is None
 
 
+# --- transient-error retry ------------------------------------------------------------------
+
+
+@pytest.fixture()
+def recorded_sleep(monkeypatch):
+    """Backoff is recorded, never waited."""
+    delays = []
+    monkeypatch.setattr(drive, "_sleep", delays.append)
+    return delays
+
+
+class _Flaky:
+    """A library call that raises the planted exceptions in order, then returns ``value``."""
+
+    def __init__(self, *exceptions, value="ok"):
+        self.pending = list(exceptions)
+        self.value = value
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if self.pending:
+            raise self.pending.pop(0)
+        return self.value
+
+
+def test_one_transient_error_is_retried_then_succeeds(google_errors, recorded_sleep, tmp_path):
+    client = drive.GoogleDriveClient(tmp_path / "token.json")
+    flaky = _Flaky(_http_error(500, "internalError"))
+    assert client._call(flaky) == "ok"
+    assert flaky.calls == 2
+    assert len(recorded_sleep) == 1
+    assert drive.RETRY_BASE_S <= recorded_sleep[0] <= 2 * drive.RETRY_BASE_S
+
+
+@pytest.mark.parametrize(
+    "exc, note",
+    [
+        (_http_error(500, "internalError"), drive.NOTE_OFFLINE),
+        (_http_error(502), drive.NOTE_OFFLINE),
+        (_http_error(503, "backendError"), drive.NOTE_OFFLINE),
+        (_http_error(504), drive.NOTE_OFFLINE),
+        (_http_error(429, "rateLimitExceeded"), drive.NOTE_QUOTA),
+        (_FakeTransportError(SECRET_MARK), drive.NOTE_OFFLINE),
+        (TimeoutError(), drive.NOTE_OFFLINE),
+        (ConnectionResetError(), drive.NOTE_OFFLINE),
+    ],
+)
+def test_sustained_transient_errors_exhaust_the_attempts_then_map(
+    google_errors, recorded_sleep, tmp_path, exc, note
+):
+    client = drive.GoogleDriveClient(tmp_path / "token.json")
+    flaky = _Flaky(*[exc] * (drive.RETRY_ATTEMPTS + 2))
+    with pytest.raises(drive.DriveError) as caught:
+        client._call(flaky)
+    assert caught.value.note == note
+    assert flaky.calls == drive.RETRY_ATTEMPTS  # bounded: never one more
+    assert len(recorded_sleep) == drive.RETRY_ATTEMPTS - 1
+    assert recorded_sleep == sorted(recorded_sleep)  # exponential: each wait at least the last
+    for attempt, delay in enumerate(recorded_sleep):
+        base = drive.RETRY_BASE_S * 2**attempt
+        assert base <= delay <= base + drive.RETRY_BASE_S  # jitter stays within one base step
+    assert SECRET_MARK not in str(caught.value) and caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "exc, note",
+    [
+        (_http_error(401), drive.NOTE_UNAUTHENTICATED),
+        (_http_error(403, "userRateLimitExceeded"), drive.NOTE_QUOTA),
+        (_http_error(404), drive.NOTE_NOT_FOUND),
+        (_http_error(400), drive.NOTE_CONVERT_FAILED),
+        (_FakeRefreshError("invalid_grant"), drive.NOTE_UNAUTHENTICATED),
+        (RuntimeError(SECRET_MARK), drive.NOTE_CONVERT_FAILED),
+    ],
+)
+def test_non_transient_errors_are_not_retried(google_errors, recorded_sleep, tmp_path, exc, note):
+    client = drive.GoogleDriveClient(tmp_path / "token.json")
+    flaky = _Flaky(exc)
+    with pytest.raises(drive.DriveError) as caught:
+        client._call(flaky)
+    assert caught.value.note == note
+    assert flaky.calls == 1 and recorded_sleep == []
+
+
+def test_a_drive_error_raised_inside_the_call_is_never_retried(recorded_sleep, tmp_path):
+    client = drive.GoogleDriveClient(tmp_path / "token.json")
+    flaky = _Flaky(drive.DriveError(drive.NOTE_UNAUTHENTICATED))  # what `_drive()` raises
+    with pytest.raises(drive.DriveError) as caught:
+        client._call(flaky)
+    assert caught.value.note == drive.NOTE_UNAUTHENTICATED
+    assert flaky.calls == 1 and recorded_sleep == []
+
+
+class _FlakyCopyClient:
+    """The fake Drive, with `copy_as_doc` going through the real client's retrying `_call`.
+
+    Each planted library exception is raised by one `files.copy` attempt, in order; once the
+    list is empty the fake's copy succeeds. Everything else is the plain fake.
+    """
+
+    def __init__(self, fake, *exceptions):
+        self._fake = fake
+        self._google = drive.GoogleDriveClient(Path("unused-token.json"))
+        self.pending = list(exceptions)
+
+    def __getattr__(self, name):
+        return getattr(self._fake, name)
+
+    def copy_as_doc(self, file_id, folder_id):
+        def attempt():
+            if self.pending:
+                raise self.pending.pop(0)
+            return self._fake.copy_as_doc(file_id, folder_id)
+
+        return self._google._call(attempt)
+
+
+def test_session_survives_one_transient_copy_failure_without_tripping(
+    google_errors, recorded_sleep, fake_drive, drive_session
+):
+    fake_drive.add_path("scans/a.pdf", size=3, text="text layer")
+    client = _FlakyCopyClient(fake_drive, _http_error(500, "internalError"))
+    session = drive_session(client=client)
+    fetched = session.fetch([("scans/a.pdf", 3)])
+    assert (fetched.text, fetched.note) == ("text layer", None)
+    assert session.tripped is None and session.status == "ok"
+    assert len(recorded_sleep) == 1
+    # The one copy that succeeded was exported and permanently deleted; nothing is left over.
+    assert len(fake_drive.called("copy_as_doc")) == 1
+    assert all(node["mark"] != drive.COPY_MARK for node in fake_drive.nodes.values())
+    # The rung keeps working for the rest of the run.
+    fake_drive.add_path("scans/b.pdf", size=4, text="more")
+    assert session.fetch([("scans/b.pdf", 4)]).text == "more"
+
+
+def test_session_trips_once_transient_copy_failures_exhaust_the_retries(
+    google_errors, recorded_sleep, fake_drive, drive_session
+):
+    fake_drive.add_path("scans/a.pdf", size=3, text="text layer")
+    client = _FlakyCopyClient(fake_drive, *[_http_error(500, "internalError")] * 10)
+    session = drive_session(client=client)
+    fetched = session.fetch([("scans/a.pdf", 3)])
+    assert (fetched.text, fetched.note) == (None, drive.NOTE_OFFLINE)
+    assert session.tripped == drive.NOTE_OFFLINE and session.status == drive.NOTE_OFFLINE
+    assert len(client.pending) == 10 - drive.RETRY_ATTEMPTS  # exactly the bounded attempts
+    assert len(recorded_sleep) == drive.RETRY_ATTEMPTS - 1
+    assert fake_drive.called("copy_as_doc") == []  # the fake copy was never reached
+    calls = len(fake_drive.calls)
+    client.pending.clear()  # even once Drive recovers, this run stays off
+    assert session.fetch([("scans/a.pdf", 3)]).note == drive.NOTE_OFFLINE
+    assert len(fake_drive.calls) == calls
+    assert SECRET_MARK not in json.dumps(session.as_dict())
+
+
 # --- sessions -------------------------------------------------------------------------------
 
 

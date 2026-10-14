@@ -101,6 +101,14 @@ confidence clears `[ocr].min_confidence`:
    one fetch, the blob (with Drive's trailing `Image labels:` annotation stripped) lands on that
    lowest pending page at a fixed `DRIVE_CONFIDENCE`, and the document's later pending pages are
    resolved at `drive` with their own text preserved. Document-accurate, page-approximate.
+   **Transient errors.** Every API call is retried up to three attempts in all, with exponential
+   backoff from about one second plus jitter, on an `HttpError` 429/500/502/503/504 and on
+   transport-level failures (httplib2, `TransportError`, socket errors); a 4xx other than 429,
+   a `RefreshError`, and any other exception are not retried. Only once the attempts are
+   exhausted does the failure become its note and reach the breaker below, so one flaky
+   `files.copy` no longer degrades the rest of the run while a sustained outage still costs one
+   failing call. A retried write that landed server-side leaves at most one extra marked object,
+   which the next run's sweep absorbs.
    **Notes.** Environment class — `drive_offline`, `drive_unauthenticated` (including the 7-day
    refresh-token expiry of an OAuth app in Testing status; `ocr run` then names `filingcabinet
    ocr auth`), `drive_quota` — counts in `degraded`, trips a per-run breaker (no further API

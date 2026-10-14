@@ -29,9 +29,11 @@ import contextlib
 import importlib.util
 import json
 import os
+import random
 import secrets
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePath
@@ -51,6 +53,12 @@ MAX_OCCURRENCES = 5
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 HTTP_TIMEOUT_S = 60
+# Transient failures (a 5xx, a 429, a dropped connection) are retried a bounded number of times
+# before they become a note and trip the breaker: a sustained outage still costs one failing
+# call per run, a single flaky `files.copy` no longer degrades the rest of the run.
+RETRY_ATTEMPTS = 3
+RETRY_BASE_S = 1.0
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 AUTH_COMMAND = "filingcabinet ocr auth"
 _MAX_LIST_PAGES = 10  # a name lookup returns a handful of entries; never page forever
 
@@ -241,8 +249,75 @@ def _map_error(exc: BaseException) -> str:
     return NOTE_CONVERT_FAILED
 
 
+def _is_transient(exc: BaseException) -> bool:
+    """Whether one more attempt may succeed: a 5xx/429 HttpError or a transport-level failure.
+
+    Reads only the status code and the exception type, never message text.
+    """
+    try:
+        from googleapiclient.errors import HttpError
+    except Exception:  # pragma: no cover - depends on the optional extra
+        HttpError = None  # noqa: N806
+    try:
+        from google.auth.exceptions import RefreshError, TransportError
+    except Exception:  # pragma: no cover - depends on the optional extra
+        RefreshError = TransportError = None  # noqa: N806
+    try:
+        from httplib2 import HttpLib2Error
+    except Exception:  # pragma: no cover - depends on the optional extra
+        HttpLib2Error = None  # noqa: N806
+
+    if RefreshError is not None and isinstance(exc, RefreshError):
+        return False  # a dead token is fixed by re-auth, never by waiting
+    if HttpError is not None and isinstance(exc, HttpError):
+        try:
+            status = int(getattr(getattr(exc, "resp", None), "status", 0) or 0)
+        except (TypeError, ValueError):
+            status = 0
+        return status in _RETRY_STATUSES
+    if TransportError is not None and isinstance(exc, TransportError):
+        return True
+    if HttpLib2Error is not None and isinstance(exc, HttpLib2Error):
+        return True
+    return isinstance(exc, (OSError, TimeoutError, ConnectionError))
+
+
+def _retry_delay(attempt: int) -> float:
+    """Exponential backoff from `RETRY_BASE_S` with jitter: about 1-2 s, then 2-3 s."""
+    return RETRY_BASE_S * (2**attempt) + random.uniform(0, RETRY_BASE_S)  # noqa: S311
+
+
+_sleep = time.sleep  # the seam tests replace so backoff is recorded, not waited
+
+
+def _execute_with_retry(fn: Callable):
+    """Run one library call, retrying a transient failure up to `RETRY_ATTEMPTS` times in all.
+
+    Re-raises the last exception untouched once attempts are exhausted; the caller maps it to
+    a note. The exception is never logged or formatted here.
+    """
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            return fn()
+        except DriveError:
+            raise
+        except Exception as exc:
+            if attempt + 1 >= RETRY_ATTEMPTS or not _is_transient(exc):
+                raise
+            _sleep(_retry_delay(attempt))
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 class GoogleDriveClient:
-    """:class:`DriveClient` over the Drive v3 API. Built lazily; no network until first use."""
+    """:class:`DriveClient` over the Drive v3 API. Built lazily; no network until first use.
+
+    Every call goes through :meth:`_call`, which retries transient failures (see
+    :func:`_execute_with_retry`) and reduces whatever remains to a :class:`DriveError`. Writes
+    are retried too: a `files.copy` or `files.create` whose first attempt landed server-side
+    before the 5xx came back leaves one extra *marked* object, which the next run's sweep (or
+    the oldest-folder rule) absorbs; a retried `files.delete` of an already-deleted copy
+    answers 404 and is counted as a delete failure, nothing more.
+    """
 
     def __init__(self, token_path: Path):
         self._token_path = Path(token_path)
@@ -268,7 +343,7 @@ class GoogleDriveClient:
 
     def _call(self, fn: Callable):
         try:
-            return fn()
+            return _execute_with_retry(fn)
         except DriveError:
             raise
         except Exception as exc:  # library-private types; reduced to a note, text dropped
